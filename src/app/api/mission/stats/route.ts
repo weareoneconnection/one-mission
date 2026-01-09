@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getRedis } from "@/lib/server/redis";
 
 type Driver = "memory" | "kv";
 
@@ -19,9 +20,9 @@ async function memGet(key: string) {
 }
 
 // ---- kv driver (prod) ----
+// 保留原函数结构，但内部改用 REDIS_URL
 async function kvClient() {
-  const mod = await import("@vercel/kv");
-  return mod.kv;
+  return getRedis();
 }
 
 export async function GET(req: Request) {

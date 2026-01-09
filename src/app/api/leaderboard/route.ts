@@ -1,6 +1,6 @@
-// src/app/api/leaderboard/route.ts
 import { NextResponse } from "next/server";
 import { memStore } from "@/lib/server/memoryStore";
+import { getRedis } from "@/lib/server/redis";
 
 export const runtime = "nodejs";
 
@@ -9,18 +9,22 @@ function num(v: any, d: number) {
   return Number.isFinite(n) ? n : d;
 }
 
+async function redisGetInt(redis: any, key: string) {
+  const v = await redis.get(key);
+  const n = Number(v ?? 0);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
 
-    const sort = (url.searchParams.get("sort") || "points") as
-      | "points"
-      | "completed";
+    const sort = (url.searchParams.get("sort") || "points") as "points" | "completed";
     const order = (url.searchParams.get("order") || "desc") as "asc" | "desc";
     const limit = Math.max(1, Math.min(200, num(url.searchParams.get("limit"), 50)));
     const wallet = (url.searchParams.get("wallet") || "").trim();
 
-    const driver = String(process.env.LEADERBOARD_STORE_DRIVER || "memory");
+    const driver = String(process.env.LEADERBOARD_STORE_DRIVER || "memory").toLowerCase();
 
     // =========================
     // ✅ MEMORY
@@ -62,23 +66,20 @@ export async function GET(req: Request) {
     }
 
     // =========================
-    // ✅ KV（上线再用）
+    // ✅ REDIS (KV)
     // =========================
-    const { kv } = await import("@vercel/kv");
+    const redis = await getRedis();
 
-    // 约定：zset key = "leaderboard:points" / "leaderboard:completed"
     const zkey = sort === "completed" ? "leaderboard:completed" : "leaderboard:points";
+    const rev = order === "desc";
 
-    // zrange: 高到低
-    const members = (await kv.zrange(zkey, 0, limit - 1, { rev: order === "desc" })) as
-      | string[]
-      | null;
+    // ✅ node-redis v4: zRange(key, start, stop, { REV: true })
+    const members = (await redis.zRange(zkey, 0, limit - 1, { REV: rev })) as string[];
 
-    const wallets = members ?? [];
     const rows = await Promise.all(
-      wallets.map(async (w) => {
-        const points = Number((await kv.get(`u:${w}:points`)) ?? 0);
-        const completed = Number((await kv.scard(`u:${w}:completedIds`)) ?? 0);
+      members.map(async (w) => {
+        const points = await redisGetInt(redis, `u:${w}:points`);
+        const completed = await redisGetInt(redis, `u:${w}:completed`);
         return { wallet: w, points, completed, updatedAt: Date.now() };
       })
     );
@@ -87,16 +88,17 @@ export async function GET(req: Request) {
     let you: any = null;
 
     if (wallet) {
-      const rank = await kv.zrank(zkey, wallet);
+      // ✅ node-redis v4: zRank / zRevRank
+      const rank = rev ? await redis.zRevRank(zkey, wallet) : await redis.zRank(zkey, wallet);
       if (typeof rank === "number") {
         youRank = rank + 1;
-        const points = Number((await kv.get(`u:${wallet}:points`)) ?? 0);
-        const completed = Number((await kv.scard(`u:${wallet}:completedIds`)) ?? 0);
+        const points = await redisGetInt(redis, `u:${wallet}:points`);
+        const completed = await redisGetInt(redis, `u:${wallet}:completed`);
         you = { wallet, points, completed, updatedAt: Date.now() };
       }
     }
 
-    const participants = Number((await kv.zcard(zkey)) ?? 0);
+    const participants = Number((await redis.zCard(zkey)) ?? 0);
 
     return NextResponse.json({
       ok: true,

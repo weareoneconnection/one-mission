@@ -1,75 +1,152 @@
 import { NextResponse } from "next/server";
-import { kv } from "@vercel/kv";
-import { mockMissions } from "@/lib/mission/mock";
+import { getRedis } from "@/lib/server/redis";
 
-type Mission = { id: string; points?: number; basePoints?: number };
+type Driver = "memory" | "kv";
+
+type VerifyBody = {
+  missionId?: string;
+  id?: string;
+
+  wallet?: string;
+  walletAddress?: string;
+  address?: string;
+
+  points?: number;
+  basePoints?: number;
+};
+
+function pickDriver(): Driver {
+  const v = String(process.env.MISSION_STORE_DRIVER || "memory").toLowerCase();
+  return v === "kv" ? "kv" : "memory";
+}
+
+// ---- memory store (dev) ----
+type MemDB = { kv: Map<string, any> };
+function getMemDB(): MemDB {
+  const g = globalThis as unknown as { __ONE_MISSION_MEMDB__?: MemDB };
+  if (!g.__ONE_MISSION_MEMDB__) g.__ONE_MISSION_MEMDB__ = { kv: new Map() };
+  return g.__ONE_MISSION_MEMDB__;
+}
+
+async function memGet(key: string) {
+  return getMemDB().kv.get(key);
+}
+async function memSet(key: string, val: any) {
+  getMemDB().kv.set(key, val);
+}
+async function memIncrBy(key: string, n: number) {
+  const cur = Number(getMemDB().kv.get(key) ?? 0);
+  const next = cur + n;
+  getMemDB().kv.set(key, next);
+  return next;
+}
+async function memIncr(key: string) {
+  return memIncrBy(key, 1);
+}
+
+// ---- kv driver (prod) ----
+async function kvClient() {
+  return getRedis();
+}
+
+function asInt(n: any, fallback = 0) {
+  const x = Number(n);
+  return Number.isFinite(x) ? Math.trunc(x) : fallback;
+}
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
+    const body = (await req.json().catch(() => ({}))) as VerifyBody;
 
-    // ✅ 兼容两种字段名：walletAddress / wallet
-    const wallet = String(body?.walletAddress || body?.wallet || "").trim();
-    const missionId = String(body?.missionId || "").trim();
+    const missionId = String(body.missionId || body.id || "").trim();
+    const wallet = String(body.wallet || body.walletAddress || body.address || "").trim();
+    const points = asInt(body.points ?? body.basePoints, 0);
 
-    if (!wallet || !missionId) {
+    if (!missionId) {
       return NextResponse.json(
-        { ok: false, error: "walletAddress + missionId required" },
+        { ok: false, error: "missing missionId (missionId/id)" },
+        { status: 400 }
+      );
+    }
+    if (!wallet) {
+      return NextResponse.json(
+        { ok: false, error: "missing wallet (wallet/walletAddress/address)" },
         { status: 400 }
       );
     }
 
-    const missions = (mockMissions as unknown as Mission[]) || [];
-    const m = missions.find((x) => x.id === missionId);
-    const add = Number(m?.basePoints ?? m?.points ?? 0);
+    const driver = pickDriver();
 
-    const missionKey = `u:${wallet}:missions`;
+    const kDone = `mission:${missionId}:${wallet}`;
+    const kPoints = `u:${wallet}:points`;
+    const kCompleted = `u:${wallet}:completed`;
 
-    // ✅ 去重：同钱包同任务只记一次
-    const existed = await kv.sismember(missionKey, missionId);
-    if (existed) {
-      const [points, completed] = await Promise.all([
-        kv.get<number>(`u:${wallet}:points`),
-        kv.get<number>(`u:${wallet}:completed`),
-      ]);
+    // 1) 防重复加分
+    const already =
+      driver === "kv" ? await (await kvClient()).get(kDone) : await memGet(kDone);
+
+    if (already) {
+      const curPoints =
+        driver === "kv"
+          ? Number((await (await kvClient()).get(kPoints)) ?? 0)
+          : Number((await memGet(kPoints)) ?? 0);
+
+      const curCompleted =
+        driver === "kv"
+          ? Number((await (await kvClient()).get(kCompleted)) ?? 0)
+          : Number((await memGet(kCompleted)) ?? 0);
 
       return NextResponse.json({
         ok: true,
-        wallet,
+        verified: true,
+        alreadyVerified: true,
         missionId,
-        duplicated: true,
-        points: Number(points ?? 0),
-        completed: Number(completed ?? 0),
+        wallet,
+        pointsAdded: 0,
+        totalPoints: curPoints,
+        completed: curCompleted,
+        driver,
       });
     }
 
-    const pointsKey = `u:${wallet}:points`;
-    const completedKey = `u:${wallet}:completed`;
+    // 2) 记为已完成 + 累加
+    if (driver === "kv") {
+      const kv = await kvClient();
 
-    await kv.sadd(missionKey, missionId);
+      // ✅ node-redis 的 set 不接受 boolean：用 "1"
+      await kv.set(kDone, "1");
 
-    const [newPoints, newCompleted] = await Promise.all([
-      kv.incrby(pointsKey, add),
-      kv.incrby(completedKey, 1),
-    ]);
+      if (points > 0) await kv.incrBy(kPoints, points); // ✅ incrBy
+      await kv.incr(kCompleted);
+    } else {
+      await memSet(kDone, true);
+      if (points > 0) await memIncrBy(kPoints, points);
+      await memIncr(kCompleted);
+    }
 
-    await Promise.all([
-      kv.zadd("lb:points", { score: Number(newPoints), member: wallet }),
-      kv.zadd("lb:completed", { score: Number(newCompleted), member: wallet }),
-    ]);
+    const totalPoints =
+      driver === "kv"
+        ? Number((await (await kvClient()).get(kPoints)) ?? 0)
+        : Number((await memGet(kPoints)) ?? 0);
+
+    const completed =
+      driver === "kv"
+        ? Number((await (await kvClient()).get(kCompleted)) ?? 0)
+        : Number((await memGet(kCompleted)) ?? 0);
 
     return NextResponse.json({
       ok: true,
-      wallet,
+      verified: true,
       missionId,
-      duplicated: false,
-      added: add,
-      points: Number(newPoints),
-      completed: Number(newCompleted),
+      wallet,
+      pointsAdded: points,
+      totalPoints,
+      completed,
+      driver,
     });
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: e?.message || "verify failed" },
+      { ok: false, error: e?.message ?? "verify_error" },
       { status: 500 }
     );
   }
