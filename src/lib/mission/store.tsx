@@ -199,7 +199,7 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
         if (cancelled) return;
 
         // 如果后端失败，也不要改成 0；保持现状即可
-        if (!res.ok) {
+        if (!res?.ok) {
           // 可选：记录错误，但不覆盖 points
         }
       } catch {
