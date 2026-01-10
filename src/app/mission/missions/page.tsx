@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import MissionCard from "../components/MissionCard";
 import MissionFilters from "../components/MissionFilters";
@@ -25,13 +25,62 @@ function StatCard({
   );
 }
 
+function Badge({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center rounded-full border border-zinc-900/10 bg-white/70 px-3 py-1 text-xs font-medium text-zinc-700">
+      {children}
+    </span>
+  );
+}
+
+function PrimaryButton({
+  children,
+  onClick,
+  disabled,
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="rounded-xl bg-black px-4 py-2 text-sm font-semibold text-white hover:bg-black/90 disabled:opacity-60"
+    >
+      {children}
+    </button>
+  );
+}
+
+function SecondaryLink({
+  href,
+  children,
+}: {
+  href: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Link
+      href={href}
+      className="rounded-xl border border-zinc-900/15 bg-white/60 px-4 py-2 text-sm font-medium text-zinc-900 hover:bg-white"
+    >
+      {children}
+    </Link>
+  );
+}
+
+function fmt(n: number) {
+  return new Intl.NumberFormat("en-US").format(n);
+}
+
 export default function MissionsPage() {
   const {
     missions,
     verify,
     points,
     completedCount,
-    reset,
 
     walletAddress,
     connecting,
@@ -45,6 +94,48 @@ export default function MissionsPage() {
   const [sort, setSort] = useState<"default" | "points_desc" | "points_asc">(
     "default"
   );
+
+  // ✅ extra stats from upgraded /api/mission/stats (optional fields)
+  const [extra, setExtra] = useState<{
+    uniqueCompleted?: number;
+    streak?: { count?: number; lastDate?: string; active?: boolean };
+    updatedAt?: number;
+  } | null>(null);
+
+  const refreshExtraStats = async (w?: string | null) => {
+    const addr = (w || walletAddress || "").trim();
+    if (!addr) return;
+
+    try {
+      const r = await fetch(`/api/mission/stats?wallet=${addr}`, {
+        method: "GET",
+        cache: "no-store",
+      });
+      const j = await r.json().catch(() => null);
+      if (r.ok && j?.ok) {
+        setExtra({
+          uniqueCompleted: typeof j.uniqueCompleted === "number" ? j.uniqueCompleted : undefined,
+          streak: j.streak || undefined,
+          updatedAt: typeof j.updatedAt === "number" ? j.updatedAt : undefined,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  // ✅ refresh stats when wallet changes
+  useEffect(() => {
+    if (!walletAddress) {
+      setExtra(null);
+      return;
+    }
+    refreshExtraStats(walletAddress);
+    // optional: poll every 30s (safe)
+    const t = setInterval(() => refreshExtraStats(walletAddress), 30_000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [walletAddress]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -74,29 +165,35 @@ export default function MissionsPage() {
 
   const progressText = `${completedCount}/${missions.length}`;
 
+  const streakCount = extra?.streak?.count ?? 0;
+  const streakActive = Boolean(extra?.streak?.active);
+  const uniqueCompleted = extra?.uniqueCompleted ?? 0;
+
   return (
     <div className="space-y-6">
-      {/* =================== 顶部执行区（不改逻辑，只升级 UI） =================== */}
+      {/* =================== TOP DASHBOARD =================== */}
       <div className="rounded-3xl border border-zinc-900/10 bg-white/70 p-6">
-        <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-          <div className="space-y-2">
-            <div className="text-xs font-medium tracking-wide text-zinc-600">
-              MISSIONS
+        <div className="flex flex-col gap-5 md:flex-row md:items-start md:justify-between">
+          {/* Left: identity + intro */}
+          <div className="space-y-3 max-w-2xl">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge>ONE MISSION</Badge>
+              <Badge>Long-term Points</Badge>
+              <Badge>Daily / Weekly / Once</Badge>
+              <Badge>Wallet Reputation</Badge>
             </div>
+
             <h2 className="text-xl md:text-2xl font-semibold text-zinc-900">
-              Execute missions & verify to earn points
+              Your mission workspace (continuous points)
             </h2>
+
             <p className="text-sm text-zinc-700">
-              This is your execution workspace. For campaign intro & prize pool,
-              go to{" "}
-              <Link href="/mission/overview" className="underline">
-                Overview
-              </Link>
-              .
+              Use <b>one wallet</b> to build a consistent reputation. Daily/weekly missions can be
+              claimed again after reset; once missions are unique.
             </p>
 
             {/* Wallet row */}
-            <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
               <span className="text-zinc-700">Wallet:</span>
 
               {walletAddress ? (
@@ -109,78 +206,79 @@ export default function MissionsPage() {
 
               <div className="ml-1 flex items-center gap-2">
                 {!walletAddress ? (
-                  <button
-                    type="button"
-                    onClick={connectWallet}
-                    disabled={connecting}
-                    className="rounded-xl bg-black px-3 py-2 text-sm font-semibold text-white hover:bg-black/90 disabled:opacity-60"
-                  >
+                  <PrimaryButton onClick={connectWallet} disabled={connecting}>
                     {connecting ? "Connecting..." : "Connect Wallet"}
-                  </button>
+                  </PrimaryButton>
                 ) : (
                   <button
                     type="button"
                     onClick={disconnectWallet}
-                    className="rounded-xl border border-zinc-900/15 bg-white/60 px-3 py-2 text-sm hover:bg-white"
+                    className="rounded-xl border border-zinc-900/15 bg-white/60 px-4 py-2 text-sm hover:bg-white"
                   >
                     Disconnect
                   </button>
                 )}
 
+                {/* manual refresh (nice) */}
                 <button
                   type="button"
-                  onClick={reset}
-                  className="rounded-xl border border-zinc-900/15 bg-white/60 px-3 py-2 text-sm hover:bg-white"
+                  onClick={() => refreshExtraStats(walletAddress)}
+                  disabled={!walletAddress}
+                  className="rounded-xl border border-zinc-900/15 bg-white/60 px-4 py-2 text-sm hover:bg-white disabled:opacity-60"
                 >
-                  Reset
+                  Refresh
                 </button>
               </div>
             </div>
+
+            {/* Quick actions */}
+            <div className="flex flex-wrap gap-2 pt-1">
+              <SecondaryLink href="/mission/overview">Overview</SecondaryLink>
+              <SecondaryLink href="/mission/rewards">Rewards</SecondaryLink>
+              <SecondaryLink href="/mission/leaderboard">Leaderboard</SecondaryLink>
+              <SecondaryLink href="/mission/history">History</SecondaryLink>
+            </div>
+
+            {/* Reset hint */}
+            <div className="text-xs text-zinc-600 pt-1">
+              Reset reference: <b>Daily missions reset at 00:00 UTC</b>. Weekly missions reset by ISO week.
+            </div>
           </div>
 
-          {/* Stats */}
+          {/* Right: stats grid */}
           <div className="grid grid-cols-2 gap-3 md:w-[420px]">
-            <StatCard label="Points" value={points} hint="Earned so far" />
+            <StatCard label="Total Points" value={fmt(points)} hint="All-time points" />
+            <StatCard label="Total Claims" value={progressText} hint="Claims (daily+weekly+once)" />
             <StatCard
-              label="Completed"
-              value={progressText}
-              hint="Verified missions"
+              label="Unique Completed"
+              value={walletAddress ? fmt(uniqueCompleted) : "—"}
+              hint="Once missions only"
             />
             <StatCard
-              label="Showing"
-              value={filtered.length}
-              hint={`Total: ${missions.length}`}
-            />
-            <StatCard
-              label="Status"
-              value={walletAddress ? "Ready" : "Connect"}
-              hint={walletAddress ? "You can verify" : "Wallet required"}
+              label="Daily Streak"
+              value={walletAddress ? `${streakCount}${streakActive ? " 🔥" : ""}` : "—"}
+              hint={streakActive ? "Active today" : "Do a daily mission to keep streak"}
             />
           </div>
         </div>
       </div>
 
-      {/* 未连接提示（更产品化 + CTA） */}
+      {/* Wallet required提示 */}
       {!walletAddress && (
         <div className="rounded-2xl border border-amber-400/30 bg-amber-50/60 p-4 text-sm text-amber-900 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
-            <div className="font-semibold">Wallet required for on-chain verify</div>
+            <div className="font-semibold">Wallet required for verification</div>
             <div className="text-amber-900/80">
-              Connect your Solana wallet to verify SOL / WAOC / NFT missions.
+              Connect your Solana wallet to verify on-chain missions and lock in your long-term points.
             </div>
           </div>
-          <button
-            type="button"
-            onClick={connectWallet}
-            disabled={connecting}
-            className="rounded-xl bg-black px-4 py-2 text-sm font-semibold text-white hover:bg-black/90 disabled:opacity-60"
-          >
+          <PrimaryButton onClick={connectWallet} disabled={connecting}>
             {connecting ? "Connecting..." : "Connect Wallet"}
-          </button>
+          </PrimaryButton>
         </div>
       )}
 
-      {/* =================== 吸顶筛选条（不改 props） =================== */}
+      {/* =================== FILTERS (sticky) =================== */}
       <div className="sticky top-0 z-10 bg-background pt-2 pb-3">
         <MissionFilters
           category={category}
@@ -196,7 +294,7 @@ export default function MissionsPage() {
         />
       </div>
 
-      {/* =================== 列表 =================== */}
+      {/* =================== LIST =================== */}
       <div className="grid gap-3">
         {filtered.length === 0 ? (
           <div className="rounded-2xl border border-zinc-900/10 bg-white/70 p-8 text-center">
@@ -211,12 +309,14 @@ export default function MissionsPage() {
               key={m.id}
               mission={m}
               onVerify={async () => {
-                // ✅ 保留你的 on-chain verify 行为：没钱包 → 先连接 → 再回来点
                 if (!walletAddress) {
                   await connectWallet();
                   return;
                 }
+                // ✅ verify keeps your onchain + server flow (store.tsx)
                 verify(m.id);
+                // ✅ optional: small delayed refresh to reflect streak/unique instantly
+                setTimeout(() => refreshExtraStats(walletAddress), 800);
               }}
             />
           ))

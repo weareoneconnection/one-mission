@@ -34,8 +34,11 @@ type VerifyResult =
     };
 
 const RPC_URL = process.env.SOLANA_RPC_URL || "";
-const WAOC_MINT = process.env.WAOC_MINT || "";
-const COLLECTION_MINT = process.env.WAOC_GENESIS_COLLECTION_MINT || "";
+const WAOC_MINT = process.env.WAOC_MINT || process.env.NEXT_PUBLIC_WAOC_MINT || "";
+const COLLECTION_MINT =
+  process.env.WAOC_GENESIS_COLLECTION_MINT ||
+  process.env.NEXT_PUBLIC_WAOC_GENESIS_COLLECTION_MINT ||
+  "";
 
 // ---------- helpers ----------
 function isValidSolanaPubkey(s: string) {
@@ -48,10 +51,23 @@ function isValidSolanaPubkey(s: string) {
 }
 
 function isHeliusRpc(url: string) {
-  return /helius/i.test(url) || /api\.helius\.xyz/i.test(url);
+  return (
+    /helius/i.test(url) ||
+    /api\.helius\.xyz/i.test(url) ||
+    /rpc\.helius\.xyz/i.test(url) ||
+    /helius-rpc\.com/i.test(url)
+  );
 }
 
-async function rpcCall<T>(method: string, params: any[] = [], timeoutMs = 12000): Promise<T> {
+/**
+ * ✅ 通用 JSON-RPC
+ * 关键：DAS 方法（getAssetsByOwner 等）要求 params 是 object，而不是 array
+ */
+async function rpcCall<T>(
+  method: string,
+  params: any = [],
+  timeoutMs = 15000
+): Promise<T> {
   if (!RPC_URL) throw new Error("SOLANA_RPC_URL not set.");
 
   const ctrl = new AbortController();
@@ -62,13 +78,14 @@ async function rpcCall<T>(method: string, params: any[] = [], timeoutMs = 12000)
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: ctrl.signal,
+      cache: "no-store",
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: Date.now(),
         method,
+        // ✅ 兼容：如果传 object，就直接用 object；如果传 array，就用 array
         params,
       }),
-      cache: "no-store",
     });
 
     const json = await res.json().catch(() => null);
@@ -86,7 +103,10 @@ async function rpcCall<T>(method: string, params: any[] = [], timeoutMs = 12000)
 }
 
 async function getSolBalanceSol(address: string) {
-  const result = await rpcCall<{ value: number }>("getBalance", [address, { commitment: "confirmed" }]);
+  const result = await rpcCall<{ value: number }>("getBalance", [
+    address,
+    { commitment: "confirmed" },
+  ]);
   return result.value / 1_000_000_000;
 }
 
@@ -129,31 +149,29 @@ async function getSplBalance(address: string, mint: string) {
 }
 
 async function ownsNftInCollectionHeliusDAS(address: string, collectionMint: string) {
-  // Only works on Helius DAS
-  const das = await rpcCall<any>("getAssetsByOwner", [
-    {
-      ownerAddress: address,
-      page: 1,
-      limit: 1000,
-      displayOptions: { showCollectionMetadata: true },
-    },
-  ]);
+  const das = await rpcCall<any>("getAssetsByOwner", {
+    ownerAddress: address,
+    page: 1,
+    limit: 1000,
+    sortBy: { sortBy: "recent_action", sortDirection: "desc" }, // ✅ 修复这里
+    displayOptions: { showCollectionMetadata: true },
+  });
 
   const items: any[] = das?.items || [];
   const hit = items.find((it) => {
     const c = it?.grouping?.find?.((g: any) => g?.group_key === "collection");
-    return c?.group_value === collectionMint;
+    return String(c?.group_value || "") === String(collectionMint);
   });
 
   return { owns: Boolean(hit), scanned: items.length };
 }
 
+
 // ---------- route ----------
 export async function POST(req: Request) {
-  // 1) parse JSON
-  let parsed: VerifyRequest;
+  let body: VerifyRequest;
   try {
-    parsed = (await req.json()) as VerifyRequest;
+    body = (await req.json()) as VerifyRequest;
   } catch {
     const r: VerifyResult = {
       ok: false,
@@ -164,13 +182,10 @@ export async function POST(req: Request) {
     return NextResponse.json(r, { status: 400 });
   }
 
-  // ✅ 从这里开始 body 一定非空
-  const body = parsed;
-
-  const verifyType = body.verifyType;
+  const verifyType = body.verifyType as VerifyType;
   const address = String(body.address || "").trim();
 
-  // 2) basic validation
+  // verifyType check
   if (!verifyType || !["SOL", "SPL", "NFT_COLLECTION"].includes(verifyType)) {
     const r: VerifyResult = {
       ok: false,
@@ -181,6 +196,7 @@ export async function POST(req: Request) {
     return NextResponse.json(r, { status: 400 });
   }
 
+  // address check
   if (!address || !isValidSolanaPubkey(address)) {
     const r: VerifyResult = {
       ok: false,
@@ -201,12 +217,14 @@ export async function POST(req: Request) {
     return NextResponse.json(r, { status: 500 });
   }
 
-  // 3) required fields validation (关键：缺字段直接 400 + 明确提示)
+  // field checks
   if (verifyType === "SOL") {
     const minSol = body.minSol;
     if (minSol != null && typeof minSol !== "number") {
-      const r: VerifyResult = { ok: false, verifyType, address, error: "minSol must be a number" };
-      return NextResponse.json(r, { status: 400 });
+      return NextResponse.json(
+        { ok: false, verifyType, address, error: "minSol must be a number" } satisfies VerifyResult,
+        { status: 400 }
+      );
     }
   }
 
@@ -215,16 +233,22 @@ export async function POST(req: Request) {
     const minAmount = body.minAmount;
 
     if (!mint) {
-      const r: VerifyResult = { ok: false, verifyType, address, error: "Missing mint" };
-      return NextResponse.json(r, { status: 400 });
+      return NextResponse.json(
+        { ok: false, verifyType, address, error: "Missing mint" } satisfies VerifyResult,
+        { status: 400 }
+      );
     }
     if (!isValidSolanaPubkey(mint)) {
-      const r: VerifyResult = { ok: false, verifyType, address, error: "Invalid mint", details: { mint } };
-      return NextResponse.json(r, { status: 400 });
+      return NextResponse.json(
+        { ok: false, verifyType, address, error: "Invalid mint", details: { mint } } satisfies VerifyResult,
+        { status: 400 }
+      );
     }
     if (minAmount != null && typeof minAmount !== "number") {
-      const r: VerifyResult = { ok: false, verifyType, address, error: "minAmount must be a number" };
-      return NextResponse.json(r, { status: 400 });
+      return NextResponse.json(
+        { ok: false, verifyType, address, error: "minAmount must be a number" } satisfies VerifyResult,
+        { status: 400 }
+      );
     }
   }
 
@@ -232,55 +256,63 @@ export async function POST(req: Request) {
     const collectionMint = String((body.collectionMint || COLLECTION_MINT || "")).trim();
 
     if (!collectionMint) {
-      const r: VerifyResult = { ok: false, verifyType, address, error: "Missing collectionMint" };
-      return NextResponse.json(r, { status: 400 });
+      return NextResponse.json(
+        { ok: false, verifyType, address, error: "Missing collectionMint" } satisfies VerifyResult,
+        { status: 400 }
+      );
     }
     if (!isValidSolanaPubkey(collectionMint)) {
-      const r: VerifyResult = {
-        ok: false,
-        verifyType,
-        address,
-        error: "Invalid collectionMint",
-        details: { collectionMint },
-      };
-      return NextResponse.json(r, { status: 400 });
+      return NextResponse.json(
+        {
+          ok: false,
+          verifyType,
+          address,
+          error: "Invalid collectionMint",
+          details: { collectionMint },
+        } satisfies VerifyResult,
+        { status: 400 }
+      );
     }
 
     if (!isHeliusRpc(RPC_URL)) {
-      const r: VerifyResult = {
-        ok: false,
-        verifyType,
-        address,
-        error: "NFT_COLLECTION requires Helius DAS RPC (getAssetsByOwner). Please use Helius SOLANA_RPC_URL.",
-        details: { rpc: RPC_URL, collectionMint },
-      };
-      return NextResponse.json(r, { status: 400 });
+      return NextResponse.json(
+        {
+          ok: false,
+          verifyType,
+          address,
+          error:
+            "NFT_COLLECTION requires a Helius DAS endpoint (getAssetsByOwner). Please use a Helius SOLANA_RPC_URL.",
+          details: { rpc: RPC_URL, collectionMint },
+        } satisfies VerifyResult,
+        { status: 400 }
+      );
     }
   }
 
-  // 4) business logic
+  // business logic
   try {
-    // --- SOL ---
     if (verifyType === "SOL") {
       const minSol = typeof body.minSol === "number" ? body.minSol : 0.1;
       const bal = await getSolBalanceSol(address);
 
       if (bal + 1e-12 >= minSol) {
-        const r: VerifyResult = { ok: true, verifyType, address, details: { balanceSol: bal, minSol } };
-        return NextResponse.json(r);
+        return NextResponse.json({
+          ok: true,
+          verifyType,
+          address,
+          details: { balanceSol: bal, minSol },
+        } satisfies VerifyResult);
       }
 
-      const r: VerifyResult = {
+      return NextResponse.json({
         ok: false,
         verifyType,
         address,
         error: `Need ≥ ${minSol.toFixed(2)} SOL`,
         details: { balanceSol: bal, minSol },
-      };
-      return NextResponse.json(r);
+      } satisfies VerifyResult);
     }
 
-    // --- SPL ---
     if (verifyType === "SPL") {
       const mint = String((body.mint || WAOC_MINT || "")).trim();
       const minAmount = typeof body.minAmount === "number" ? body.minAmount : 10_000;
@@ -288,56 +320,62 @@ export async function POST(req: Request) {
       const { total, decimals, accounts } = await getSplBalance(address, mint);
 
       if (total + 1e-12 >= minAmount) {
-        const r: VerifyResult = {
+        return NextResponse.json({
           ok: true,
           verifyType,
           address,
           details: { mint, total, minAmount, decimals, accounts },
-        };
-        return NextResponse.json(r);
+        } satisfies VerifyResult);
       }
 
-      const r: VerifyResult = {
+      return NextResponse.json({
         ok: false,
         verifyType,
         address,
         error: `Need ≥ ${minAmount} tokens`,
         details: { mint, total, minAmount, decimals, accounts },
-      };
-      return NextResponse.json(r);
+      } satisfies VerifyResult);
     }
 
-    // --- NFT_COLLECTION ---
     if (verifyType === "NFT_COLLECTION") {
       const collectionMint = String((body.collectionMint || COLLECTION_MINT || "")).trim();
 
       const { owns, scanned } = await ownsNftInCollectionHeliusDAS(address, collectionMint);
 
       if (owns) {
-        const r: VerifyResult = {
+        return NextResponse.json({
           ok: true,
           verifyType,
           address,
           details: { collectionMint, owns, scanned, method: "helius_das" },
-        };
-        return NextResponse.json(r);
+        } satisfies VerifyResult);
       }
 
-      const r: VerifyResult = {
+      return NextResponse.json({
         ok: false,
         verifyType,
         address,
         error: "NFT not found in collection",
         details: { collectionMint, owns, scanned, method: "helius_das" },
-      };
-      return NextResponse.json(r);
+      } satisfies VerifyResult);
     }
 
-    const r: VerifyResult = { ok: false, verifyType, address, error: "Unsupported verifyType" };
-    return NextResponse.json(r, { status: 400 });
+    return NextResponse.json(
+      { ok: false, verifyType, address, error: "Unsupported verifyType" } satisfies VerifyResult,
+      { status: 400 }
+    );
   } catch (e: any) {
     const msg = String(e?.message || e || "Unknown error");
-    const r: VerifyResult = { ok: false, verifyType, address, error: `RPC error: ${msg}` };
-    return NextResponse.json(r, { status: 500 });
+    return NextResponse.json(
+      {
+        ok: false,
+        verifyType,
+        address,
+        error: `RPC error: ${msg}`,
+        details: { rpc: RPC_URL },
+      } satisfies VerifyResult,
+      { status: 500 }
+    );
   }
 }
+

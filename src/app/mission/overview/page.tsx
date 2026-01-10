@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { useWallet } from "@solana/wallet-adapter-react";
 import { mockMissions } from "@/lib/mission/mock";
 
 type Mission = {
@@ -13,14 +14,51 @@ type Mission = {
   completed?: boolean;
 };
 
-const PRIZE_POOL_SOL = 0; // ✅ 不展示 SOL（结构不变）
-const PRIZE_POOL_WAOC = 5_000_000; // ✅ 改成 5,000,000 WAOC
-const EVENT_STATUS: "LIVE" | "UPCOMING" | "ENDED" = "LIVE"; // ✅ 改成真实状态
-const RESET_RULE = "Daily reset at 00:00 UTC"; // ✅ 改成真实规则
+type StatsResp = {
+  ok: boolean;
+  wallet: string;
+  driver: "memory" | "kv";
+  period: { today: string; week: string };
+  points: { today: number; week: number; all: number };
+  completed: { all: number };
+  streak: { count: number; lastDate: string; active: boolean };
+};
+
+type LedgerItem = {
+  ts?: number;
+  wallet?: string;
+  missionId?: string;
+  period?: "once" | "daily" | "weekly";
+  periodKey?: string;
+  amount?: number;
+  reason?: string;
+  raw?: string;
+};
+
+type HistoryResp = {
+  ok: boolean;
+  wallet: string;
+  items: LedgerItem[];
+};
+
+type LeaderboardResp = {
+  ok: boolean;
+  participants: number;
+};
+
+const PRIZE_POOL_WAOC = 5_000_000;
+const EVENT_STATUS: "LIVE" | "UPCOMING" | "ENDED" = "LIVE";
+const RESET_RULE = "Daily reset at 00:00 UTC";
 const VERIFICATION_NOTE =
-  "Verification is on-chain / wallet-based where applicable. No private keys required.";
-const PRIMARY_CTA_HREF = "/mission/missions"; // ✅ 你的真正任务执行入口
+  "Verification is wallet-based / on-chain where applicable. No private keys required.";
+
+const PRIMARY_CTA_HREF = "/mission/missions";
 const SECONDARY_CTA_HREF = "/mission/rewards";
+
+// ✅ 你可以随时调整这三个长期任务的分数
+const DAILY_CHECKIN_POINTS = 20;
+const DAILY_SHARE_POINTS = 10;
+const WEEKLY_VOTE_POINTS = 50;
 
 function Badge({ children }: { children: React.ReactNode }) {
   return (
@@ -70,13 +108,7 @@ function SectionTitle({
   );
 }
 
-function Pill({
-  active,
-  children,
-}: {
-  active?: boolean;
-  children: React.ReactNode;
-}) {
+function Pill({ active, children }: { active?: boolean; children: React.ReactNode }) {
   return (
     <span
       className={[
@@ -93,21 +125,43 @@ function fmtNumber(n: number) {
   return new Intl.NumberFormat("en-US").format(n);
 }
 
+function shortWallet(w: string) {
+  if (!w) return "";
+  return `${w.slice(0, 4)}…${w.slice(-4)}`;
+}
+
+function timeAgo(ts?: number) {
+  if (!ts) return "—";
+  const diff = Date.now() - ts;
+  const s = Math.max(0, Math.floor(diff / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}
+
+async function safeJson<T>(res: Response): Promise<T | null> {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
 export default function MissionOverviewPage() {
+  const { publicKey, connected } = useWallet();
+  const wallet = useMemo(() => publicKey?.toBase58?.() ?? "", [publicKey]);
+
   const featured = useMemo(() => {
     const list = (mockMissions as Mission[]) || [];
-    // 优先显示 points 高/标题有代表性的任务，最多 6 个
-    return [...list]
-      .sort((a, b) => (b.points ?? 0) - (a.points ?? 0))
-      .slice(0, 6);
+    return [...list].sort((a, b) => (b.points ?? 0) - (a.points ?? 0)).slice(0, 6);
   }, []);
 
   const statusLabel =
-    EVENT_STATUS === "LIVE"
-      ? "Live Now"
-      : EVENT_STATUS === "UPCOMING"
-      ? "Starting Soon"
-      : "Ended";
+    EVENT_STATUS === "LIVE" ? "Live Now" : EVENT_STATUS === "UPCOMING" ? "Starting Soon" : "Ended";
 
   const statusTone =
     EVENT_STATUS === "LIVE"
@@ -115,6 +169,88 @@ export default function MissionOverviewPage() {
       : EVENT_STATUS === "UPCOMING"
       ? "bg-amber-50 border-amber-200 text-amber-800"
       : "bg-muted/30 border-muted text-muted-foreground";
+
+  const [stats, setStats] = useState<StatsResp | null>(null);
+  const [history, setHistory] = useState<LedgerItem[]>([]);
+  const [participants, setParticipants] = useState<number | null>(null);
+
+  const [busy, setBusy] = useState<null | "checkin" | "share" | "vote">(null);
+  const [msg, setMsg] = useState<string>("");
+
+  async function refreshAll(w: string) {
+    if (!w) return;
+
+    // stats
+    const sRes = await fetch(`/api/mission/stats?wallet=${encodeURIComponent(w)}`, {
+      cache: "no-store",
+    });
+    const sJson = await safeJson<StatsResp>(sRes);
+    if (sJson?.ok) setStats(sJson);
+
+    // history (ledger)
+    const hRes = await fetch(`/api/mission/history?wallet=${encodeURIComponent(w)}&limit=20`, {
+      cache: "no-store",
+    });
+    const hJson = await safeJson<HistoryResp>(hRes);
+    if (hJson?.ok) setHistory(Array.isArray(hJson.items) ? hJson.items : []);
+
+    // participants from leaderboard (all-time points)
+    const pRes = await fetch(`/api/leaderboard?period=all&sort=points&order=desc&limit=1`, {
+      cache: "no-store",
+    });
+    const pJson = await safeJson<LeaderboardResp>(pRes);
+    if (pJson?.ok && typeof pJson.participants === "number") setParticipants(pJson.participants);
+  }
+
+  useEffect(() => {
+    setMsg("");
+    setStats(null);
+    setHistory([]);
+    if (!wallet) return;
+    refreshAll(wallet);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wallet]);
+
+  async function claim(missionId: string, points: number, tag: "checkin" | "share" | "vote") {
+    if (!wallet) {
+      setMsg("Connect your wallet first.");
+      return;
+    }
+    setMsg("");
+    setBusy(tag);
+    try {
+      const res = await fetch("/api/mission/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          missionId,
+          wallet,
+          points,
+        }),
+      });
+
+      const json = await safeJson<any>(res);
+
+      if (!res.ok || !json?.ok) {
+        setMsg(json?.error ? `Error: ${json.error}` : "Request failed.");
+        return;
+      }
+
+      if (json?.alreadyVerified) {
+        setMsg("Already claimed for this period ✅");
+      } else {
+        setMsg(`+${points} points ✅`);
+      }
+
+      await refreshAll(wallet);
+    } catch (e: any) {
+      setMsg(e?.message ? `Error: ${e.message}` : "Error");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const yourStatus = connected ? "Connected" : "Not connected";
 
   return (
     <div className="space-y-10">
@@ -128,16 +264,16 @@ export default function MissionOverviewPage() {
               </span>
               <Badge>One Mission</Badge>
               <Badge>WAOC Ecosystem</Badge>
-              <Badge>Points → Rewards</Badge>
+              <Badge>Daily · Weekly · Streak</Badge>
             </div>
 
             <h1 className="text-2xl md:text-4xl font-semibold leading-tight">
-              Complete missions, build reputation, unlock rewards.
+              Long-term missions. Continuous points. Real reputation.
             </h1>
 
             <p className="text-sm md:text-base text-muted-foreground">
-              One Mission is the public mission campaign for WAOC. Earn points by completing
-              community + on-chain + growth missions, then unlock rewards from the prize pool.
+              Use the <b>same wallet</b> to build a long-term contribution record. Daily/weekly missions
+              reset by period, points accumulate forever, and streak rewards consistency.
             </p>
 
             <div className="flex flex-wrap gap-3 pt-2">
@@ -145,7 +281,7 @@ export default function MissionOverviewPage() {
                 href={PRIMARY_CTA_HREF}
                 className="inline-flex items-center justify-center rounded-xl bg-black px-5 py-3 text-sm font-medium text-white hover:opacity-90"
               >
-                Start Missions
+                Open Missions
               </Link>
               <Link
                 href={SECONDARY_CTA_HREF}
@@ -153,10 +289,58 @@ export default function MissionOverviewPage() {
               >
                 View Rewards
               </Link>
+              <Link
+                href="/mission/leaderboard"
+                className="inline-flex items-center justify-center rounded-xl border px-5 py-3 text-sm font-medium hover:bg-muted"
+              >
+                Leaderboard
+              </Link>
             </div>
 
-            <div className="text-xs text-muted-foreground pt-1">
-              {VERIFICATION_NOTE}
+            <div className="text-xs text-muted-foreground pt-1">{VERIFICATION_NOTE}</div>
+
+            {/* Quick actions */}
+            <div className="rounded-2xl border bg-muted/10 p-4 mt-3">
+              <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">Quick Actions</div>
+                  <div className="text-xs text-muted-foreground">
+                    Claim daily/weekly points with this wallet. (Period-based anti-duplicate)
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => claim("daily:checkin", DAILY_CHECKIN_POINTS, "checkin")}
+                    disabled={!wallet || busy !== null}
+                    className="inline-flex items-center justify-center rounded-xl bg-black px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+                  >
+                    {busy === "checkin" ? "Claiming…" : `Daily Check-in +${DAILY_CHECKIN_POINTS}`}
+                  </button>
+
+                  <button
+                    onClick={() => claim("daily:share", DAILY_SHARE_POINTS, "share")}
+                    disabled={!wallet || busy !== null}
+                    className="inline-flex items-center justify-center rounded-xl border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+                  >
+                    {busy === "share" ? "Claiming…" : `Daily Share +${DAILY_SHARE_POINTS}`}
+                  </button>
+
+                  <button
+                    onClick={() => claim("weekly:vote", WEEKLY_VOTE_POINTS, "vote")}
+                    disabled={!wallet || busy !== null}
+                    className="inline-flex items-center justify-center rounded-xl border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+                  >
+                    {busy === "vote" ? "Claiming…" : `Weekly Vote +${WEEKLY_VOTE_POINTS}`}
+                  </button>
+                </div>
+              </div>
+
+              {msg ? (
+                <div className="mt-3 text-sm">
+                  <span className="rounded-lg border bg-white px-3 py-2 inline-block">{msg}</span>
+                </div>
+              ) : null}
             </div>
           </div>
 
@@ -164,12 +348,7 @@ export default function MissionOverviewPage() {
           <div className="w-full md:w-[360px] space-y-3">
             <div className="rounded-2xl border bg-muted/20 p-5">
               <div className="text-xs text-muted-foreground">Prize Pool</div>
-
-              {/* ✅ 只改这一行：不显示 SOL，只显示 5,000,000 WAOC */}
-              <div className="mt-1 text-2xl font-semibold">
-                {fmtNumber(PRIZE_POOL_WAOC)} WAOC
-              </div>
-
+              <div className="mt-1 text-2xl font-semibold">{fmtNumber(PRIZE_POOL_WAOC)} WAOC</div>
               <div className="mt-2 text-sm text-muted-foreground">
                 Distributed by points & milestones.
               </div>
@@ -179,33 +358,110 @@ export default function MissionOverviewPage() {
               <div className="text-xs text-muted-foreground">Reset Rule</div>
               <div className="text-sm font-medium">{RESET_RULE}</div>
               <div className="text-xs text-muted-foreground">
-                Some missions may be one-time, others can reset.
+                Daily/Weekly missions are period-based. Your total points never reset.
               </div>
             </div>
 
             <div className="rounded-2xl border bg-white p-5 space-y-2">
-              <div className="text-xs text-muted-foreground">Safety</div>
+              <div className="text-xs text-muted-foreground">Wallet</div>
               <div className="text-sm">
-                WAOC will <b>never</b> ask for seed phrases or private keys.
+                Status: <b>{yourStatus}</b>
               </div>
               <div className="text-xs text-muted-foreground">
-                Verify only via official links inside this site.
+                {wallet ? `Address: ${shortWallet(wallet)}` : "Connect wallet to start earning."}
               </div>
             </div>
           </div>
         </div>
       </div>
 
-      {/* =================== STATS =================== */}
+      {/* =================== STATS (REAL) =================== */}
       <div className="grid gap-4 md:grid-cols-4">
-        <StatCard label="Participants" value="—" sub="Connect wallet to join." />
         <StatCard
-          label="Missions"
-          value={(mockMissions as Mission[]).length}
-          sub="Growth · On-chain · Community"
+          label="Participants"
+          value={participants == null ? "—" : fmtNumber(participants)}
+          sub="Based on leaderboard records."
         />
-        <StatCard label="Points Issued" value="—" sub="Updates as missions verified." />
-        <StatCard label="Your Status" value="Connected" sub="Go to Missions to verify." />
+        <StatCard
+          label="Your Total Points"
+          value={stats ? fmtNumber(stats.points.all) : "—"}
+          sub={wallet ? "Accumulates forever." : "Connect wallet to join."}
+        />
+        <StatCard
+          label="Today / This Week"
+          value={
+            stats ? (
+              <span>
+                {fmtNumber(stats.points.today)} / {fmtNumber(stats.points.week)}
+              </span>
+            ) : (
+              "—"
+            )
+          }
+          sub="Period-based points."
+        />
+        <StatCard
+          label="Streak"
+          value={stats ? fmtNumber(stats.streak.count) : "—"}
+          sub={
+            stats
+              ? stats.streak.active
+                ? "Active today ✅"
+                : "Not active today"
+              : "Complete a daily mission to build streak."
+          }
+        />
+      </div>
+
+      {/* =================== LEDGER (RECENT POINTS) =================== */}
+      <div className="rounded-2xl border bg-white p-6">
+        <SectionTitle
+          eyebrow="ACTIVITY"
+          title="Recent points history"
+          desc="This is your points ledger (auditable record)."
+        />
+
+        <div className="mt-5">
+          {!wallet ? (
+            <div className="text-sm text-muted-foreground">Connect your wallet to see history.</div>
+          ) : history.length === 0 ? (
+            <div className="text-sm text-muted-foreground">No records yet. Claim a mission above.</div>
+          ) : (
+            <div className="space-y-2">
+              {history.slice(0, 10).map((it, idx) => (
+                <div
+                  key={idx}
+                  className="flex items-center justify-between gap-3 rounded-xl border bg-muted/10 p-4"
+                >
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">
+                      {it.missionId ?? "record"}{" "}
+                      <span className="text-xs text-muted-foreground">
+                        {it.period ? `· ${it.period}` : ""}
+                        {it.periodKey ? ` · ${it.periodKey}` : ""}
+                      </span>
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {timeAgo(it.ts)} {it.reason ? `· ${it.reason}` : ""}
+                    </div>
+                  </div>
+                  <div className="text-sm font-semibold">
+                    {typeof it.amount === "number" ? `+${fmtNumber(it.amount)}` : "—"}
+                  </div>
+                </div>
+              ))}
+
+              <div className="pt-2">
+                <Link
+                  href="/mission/rewards"
+                  className="inline-flex items-center justify-center rounded-xl border px-4 py-2 text-sm font-medium hover:bg-muted"
+                >
+                  View rewards details →
+                </Link>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* =================== HOW IT WORKS =================== */}
@@ -213,15 +469,15 @@ export default function MissionOverviewPage() {
         <div className="rounded-2xl border bg-white p-6">
           <SectionTitle
             eyebrow="HOW IT WORKS"
-            title="Simple flow, real incentives"
-            desc="Overview is for public explanation. Missions is where you actually execute & verify tasks."
+            title="Long-term loop (not one-time)"
+            desc="Daily / Weekly resets keep the system alive. Ledger keeps it fair."
           />
           <div className="mt-5 space-y-3 text-sm">
             {[
-              { k: "1", t: "Connect wallet", d: "Use the same wallet to build a consistent reputation." },
-              { k: "2", t: "Complete missions", d: "Follow, join, contribute, on-chain actions (where applicable)." },
-              { k: "3", t: "Verify & earn points", d: "Verification prevents repeated clicks & keeps fairness." },
-              { k: "4", t: "Unlock rewards", d: "Rewards unlock by points thresholds & milestones." },
+              { k: "1", t: "Use one wallet", d: "Same wallet = consistent identity & reputation." },
+              { k: "2", t: "Claim daily/weekly missions", d: "Missions reset by periodKey (daily/weekly)." },
+              { k: "3", t: "Points ledger records everything", d: "Every points change is recorded and auditable." },
+              { k: "4", t: "Streak rewards consistency", d: "Daily missions build streak to encourage retention." },
             ].map((x) => (
               <div key={x.k} className="flex gap-3 rounded-xl border bg-muted/10 p-4">
                 <div className="h-7 w-7 shrink-0 rounded-lg border bg-white flex items-center justify-center text-xs font-semibold">
@@ -236,10 +492,10 @@ export default function MissionOverviewPage() {
           </div>
 
           <div className="mt-5 flex flex-wrap gap-2">
-            <Pill active>Transparent</Pill>
-            <Pill>Anti-spam</Pill>
-            <Pill>Points-based</Pill>
-            <Pill>Reward thresholds</Pill>
+            <Pill active>Ledger-based</Pill>
+            <Pill>Daily/Weekly</Pill>
+            <Pill>Streak</Pill>
+            <Pill>Anti-duplicate</Pill>
           </div>
         </div>
 
@@ -247,7 +503,7 @@ export default function MissionOverviewPage() {
           <SectionTitle
             eyebrow="REWARDS"
             title="Prize pool distribution"
-            desc="Show a clear, public-facing reward ladder. Keep details inside Rewards page."
+            desc="Keep thresholds clear; details inside Rewards page."
           />
 
           <div className="mt-5 space-y-3 text-sm">
@@ -284,7 +540,7 @@ export default function MissionOverviewPage() {
           <SectionTitle
             eyebrow="FEATURED"
             title="Featured missions (preview)"
-            desc="Only preview here. Go to Missions page to execute & verify."
+            desc="Preview only. Go to Missions page to execute & verify."
           />
           <Link
             href={PRIMARY_CTA_HREF}
@@ -331,28 +587,24 @@ export default function MissionOverviewPage() {
 
       {/* =================== FAQ =================== */}
       <div className="rounded-2xl border bg-white p-6">
-        <SectionTitle
-          eyebrow="FAQ"
-          title="Common questions"
-          desc="Keep the answers short here; full details can live in Docs later."
-        />
+        <SectionTitle eyebrow="FAQ" title="Common questions" desc="Short answers here; details later in Docs." />
         <div className="mt-5 grid gap-4 md:grid-cols-2">
           {[
             {
-              q: "Do I need to pay anything?",
-              a: "No. Some missions may require on-chain actions, but One Mission itself does not require payment.",
+              q: "Do points reset?",
+              a: "Your total points never reset. Only daily/weekly points reset by period.",
             },
             {
-              q: "Why points instead of instant rewards?",
-              a: "Points enable fair distribution and reduce spam. Rewards unlock by thresholds and milestones.",
+              q: "How is duplicate prevented?",
+              a: "Claims are stored by periodKey (daily/weekly) so repeated clicks won’t add points again.",
             },
             {
-              q: "How do you verify tasks?",
-              a: "Depending on mission type: wallet checks, signatures, or community verification logic (no private keys).",
+              q: "Is it on-chain?",
+              a: "Some missions can be verified on-chain (SOL/SPL/NFT). Others are wallet-based proofs.",
             },
             {
-              q: "Where do I actually do tasks?",
-              a: "Go to the Missions page. Overview is only the public landing page.",
+              q: "Where do I execute missions?",
+              a: "Go to the Missions page for the full mission list and verification steps.",
             },
           ].map((x) => (
             <div key={x.q} className="rounded-2xl border bg-muted/10 p-5">
@@ -368,7 +620,7 @@ export default function MissionOverviewPage() {
         <div className="space-y-1">
           <div className="text-sm text-muted-foreground">Ready to participate?</div>
           <div className="text-xl md:text-2xl font-semibold">
-            Start your first mission and climb the leaderboard.
+            Keep your streak. Grow your score. Climb weekly leaderboard.
           </div>
         </div>
         <div className="flex gap-3">
@@ -376,7 +628,7 @@ export default function MissionOverviewPage() {
             href={PRIMARY_CTA_HREF}
             className="inline-flex items-center justify-center rounded-xl bg-black px-5 py-3 text-sm font-medium text-white hover:opacity-90"
           >
-            Start Missions
+            Open Missions
           </Link>
           <Link
             href="/mission/leaderboard"

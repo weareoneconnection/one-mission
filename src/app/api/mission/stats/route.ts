@@ -20,9 +20,31 @@ async function memGet(key: string) {
 }
 
 // ---- kv driver (prod) ----
-// 保留原函数结构，但内部改用 REDIS_URL
 async function kvClient() {
   return getRedis();
+}
+
+function asInt(v: any, d = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : d;
+}
+
+async function redisGetInt(redis: any, key: string) {
+  const v = await redis.get(key);
+  return asInt(v, 0);
+}
+
+async function redisHGet(redis: any, key: string, field: string) {
+  if (typeof redis.hGet === "function") return await redis.hGet(key, field);
+  // fallback: some env stores json string
+  const raw = await redis.get(key);
+  if (!raw) return null;
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return parsed?.[field] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export async function GET(req: Request) {
@@ -38,25 +60,99 @@ export async function GET(req: Request) {
     }
 
     const driver = pickDriver();
-    const kPoints = `u:${wallet}:points`;
-    const kCompleted = `u:${wallet}:completed`;
 
-    const points =
-      driver === "kv"
-        ? Number((await (await kvClient()).get(kPoints)) ?? 0)
-        : Number((await memGet(kPoints)) ?? 0);
+    // legacy keys (v1)
+    const kOldPoints = `u:${wallet}:points`;
+    const kOldCompleted = `u:${wallet}:completed`;
 
-    const completed =
-      driver === "kv"
-        ? Number((await (await kvClient()).get(kCompleted)) ?? 0)
-        : Number((await memGet(kCompleted)) ?? 0);
+    // new keys (v2)
+    const kProfile = `u:${wallet}:profile`;
+
+    if (driver === "kv") {
+      const redis = await kvClient();
+
+      // ✅ prefer v2 profile totals; fallback legacy
+      const points_total = asInt(await redisHGet(redis, kProfile, "points_total"), 0);
+      const completed_total = asInt(await redisHGet(redis, kProfile, "completed_total"), 0);
+      const unique_once_total = asInt(await redisHGet(redis, kProfile, "unique_once_total"), 0);
+
+      const streak_count = asInt(await redisHGet(redis, kProfile, "streak_count"), 0);
+      const streak_last_date = String((await redisHGet(redis, kProfile, "streak_last_date")) || "");
+      const updatedAt = asInt(await redisHGet(redis, kProfile, "updatedAt"), 0);
+
+      const legacyPoints = await redisGetInt(redis, kOldPoints);
+      const legacyCompleted = await redisGetInt(redis, kOldCompleted);
+
+      const points = points_total || legacyPoints;
+      const completed = completed_total || legacyCompleted;
+
+      // ✅ 兼容前端：同时给 points & totalPoints；completed & completedCount
+      return NextResponse.json({
+        ok: true,
+        wallet,
+        driver,
+
+        // legacy-compatible
+        points,
+        completed,
+
+        // compatibility aliases (your store.ts supports these)
+        totalPoints: points,
+        completedCount: completed,
+
+        // ✅ new metrics
+        uniqueCompleted: unique_once_total,
+        completedMeaning: "total_claims",
+        uniqueMeaning: "unique_once",
+
+        streak: {
+          count: streak_count,
+          lastDate: streak_last_date,
+          active: Boolean(streak_last_date) && streak_last_date === new Date().toISOString().slice(0, 10),
+        },
+
+        updatedAt,
+      });
+    }
+
+    // ---- memory driver ----
+    const profile = (await memGet(kProfile)) ?? {};
+    const points_total = asInt(profile?.points_total, 0);
+    const completed_total = asInt(profile?.completed_total, 0);
+    const unique_once_total = asInt(profile?.unique_once_total, 0);
+
+    const streak_count = asInt(profile?.streak_count, 0);
+    const streak_last_date = String(profile?.streak_last_date || "");
+    const updatedAt = asInt(profile?.updatedAt, 0);
+
+    const legacyPoints = asInt(await memGet(kOldPoints), 0);
+    const legacyCompleted = asInt(await memGet(kOldCompleted), 0);
+
+    const points = points_total || legacyPoints;
+    const completed = completed_total || legacyCompleted;
 
     return NextResponse.json({
       ok: true,
       wallet,
+      driver: "memory",
+
       points,
       completed,
-      driver,
+
+      totalPoints: points,
+      completedCount: completed,
+
+      uniqueCompleted: unique_once_total,
+      completedMeaning: "total_claims",
+      uniqueMeaning: "unique_once",
+
+      streak: {
+        count: streak_count,
+        lastDate: streak_last_date,
+        active: Boolean(streak_last_date) && streak_last_date === new Date().toISOString().slice(0, 10),
+      },
+
+      updatedAt,
     });
   } catch (e: any) {
     return NextResponse.json(
