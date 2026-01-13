@@ -15,32 +15,33 @@ type RewardTier = {
 const TIERS: RewardTier[] = [
   {
     id: "og",
-    title: "OG Role",
-    requiredPoints: 500,
-    desc: "Community OG role (manual verification).",
+    title: "Contributor (OG Role)",
+    requiredPoints: 1500,
+    desc: "Foundational identity for early & verified contributors (manual verification).",
     badge: "Starter",
   },
   {
     id: "early",
-    title: "Early Access",
-    requiredPoints: 1000,
-    desc: "Early access list / priority drops (manual verification).",
+    title: "Core Contributor (Early Access)",
+    requiredPoints: 3500,
+    desc: "Priority access to missions / drops / product access (manual verification).",
     badge: "Priority",
   },
   {
     id: "genesis",
-    title: "Genesis NFT",
-    requiredPoints: 2000,
-    desc: "Genesis eligibility (manual verification).",
+    title: "Genesis Eligible (NFT)",
+    requiredPoints: 7000,
+    desc: "Genesis eligibility & historical identity anchor (manual verification).",
     badge: "Top",
   },
 ];
 
 // ✅ 人工发放：提交入口（你可改成自己的官方渠道）
 const OFFICIAL_SUBMIT_TEXT = "Submit Claim Info via official community channel only.";
-const OFFICIAL_SUBMIT_HINT = "Admins will verify points & completed missions, then distribute manually.";
+const OFFICIAL_SUBMIT_HINT =
+  "Admins will verify points & completed missions, then distribute manually. No private keys ever.";
 const OFFICIAL_SUBMIT_CTA_LABEL = "Go to Official Channel";
-const OFFICIAL_SUBMIT_CTA_HREF = "/mission/overview"; // 你也可以改成 /community 或 docs 页里放 TG/Discord 官方链接聚合
+const OFFICIAL_SUBMIT_CTA_HREF = "/mission/overview";
 
 function mask(addr: string) {
   return `${addr.slice(0, 4)}…${addr.slice(-4)}`;
@@ -79,7 +80,9 @@ function Pill({
     <span
       className={[
         "inline-flex items-center rounded-full px-3 py-1 text-xs border",
-        active ? "bg-black text-white border-black" : "bg-white/60 border-zinc-900/15",
+        active
+          ? "bg-black text-white border-black"
+          : "bg-white/60 border-zinc-900/15",
       ].join(" ")}
     >
       {children}
@@ -88,12 +91,10 @@ function Pill({
 }
 
 async function copyText(text: string) {
-  // Clipboard API
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
     return;
   }
-  // Fallback
   const ta = document.createElement("textarea");
   ta.value = text;
   ta.style.position = "fixed";
@@ -109,7 +110,6 @@ export default function RewardsPage() {
     walletAddress,
     connecting,
     connectWallet,
-    // 如果你的 store 里字段名不同，改这里即可（其余 UI 不动）
     points,
     completedCount,
   } = useMission() as any;
@@ -134,7 +134,7 @@ export default function RewardsPage() {
 
   const headerSub = walletAddress
     ? `Wallet connected: ${mask(walletAddress)}`
-    : "Connect wallet to unlock eligibility.";
+    : "Connect wallet to view eligibility status.";
 
   const claimInfoBase = useMemo(() => {
     const now = new Date().toISOString();
@@ -149,13 +149,14 @@ export default function RewardsPage() {
         <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
           <div className="space-y-2">
             <div className="text-xs font-medium tracking-wide text-zinc-600">
-              REWARDS
+              IDENTITY & REWARDS
             </div>
             <h2 className="text-xl md:text-2xl font-semibold text-zinc-900">
-              Unlock rewards by points
+              Unlock eligibility through verified contribution
             </h2>
             <p className="text-sm text-zinc-700">
-              {headerSub} Rewards are <b>manually distributed</b> for now.
+              {headerSub} Eligibility may be <b>manually verified</b> before
+              distribution.
             </p>
 
             {!walletAddress ? (
@@ -173,19 +174,33 @@ export default function RewardsPage() {
           </div>
 
           <div className="grid grid-cols-2 gap-3 md:w-[420px]">
-            <StatCard label="Points" value={fmtNumber(totalPoints)} sub="Earned so far" />
-            <StatCard label="Completed" value={completed} sub="Verified missions" />
             <StatCard
-              label="Highest Tier"
+              label="Total Points"
+              value={fmtNumber(totalPoints)}
+              sub="All-time contribution index"
+            />
+            <StatCard
+              label="Verified Missions"
+              value={completed}
+              sub="Completed & verified"
+            />
+            <StatCard
+              label="Highest Eligible"
               value={topUnlocked ? topUnlocked.title : "—"}
-              sub={topUnlocked ? `≥ ${fmtNumber(topUnlocked.requiredPoints)} pts` : "Not eligible yet"}
+              sub={
+                topUnlocked
+                  ? `≥ ${fmtNumber(topUnlocked.requiredPoints)} pts`
+                  : "Not eligible yet"
+              }
             />
             <StatCard
               label="Next Target"
-              value={nextTier ? nextTier.title : "All unlocked"}
+              value={nextTier ? nextTier.title : "All tiers reached"}
               sub={
                 nextTier
-                  ? `Need ${fmtNumber(Math.max(0, nextTier.requiredPoints - totalPoints))} pts`
+                  ? `Need ${fmtNumber(
+                      Math.max(0, nextTier.requiredPoints - totalPoints)
+                    )} pts`
                   : "You reached the top tier"
               }
             />
@@ -221,26 +236,32 @@ export default function RewardsPage() {
       {/* Tiers */}
       <div className="grid gap-4 md:grid-cols-2">
         {TIERS.map((t) => {
-          const eligible = walletAddress && totalPoints >= t.requiredPoints;
+          const hasWallet = Boolean(walletAddress);
+          const eligible = hasWallet && totalPoints >= t.requiredPoints;
           const need = Math.max(0, t.requiredPoints - totalPoints);
 
-          const statusPill = !walletAddress ? (
+          const statusPill = !hasWallet ? (
             <Pill>Connect wallet</Pill>
           ) : eligible ? (
             <Pill active>Eligible</Pill>
           ) : (
-            <Pill>Locked</Pill>
+            <Pill>Not eligible</Pill>
           );
 
           const claimInfo = [
             `Campaign: WAOC One Mission`,
-            `Reward: ${t.title}`,
+            `Identity/Reward: ${t.title}`,
             `Wallet: ${walletAddress ?? "NOT_CONNECTED"}`,
-            `Points: ${totalPoints}`,
-            `Completed: ${completed}`,
+            `Points (all-time): ${totalPoints}`,
+            `Verified missions: ${completed}`,
             `Timestamp: ${claimInfoBase.now}`,
             `Nonce: ${claimInfoBase.nonce}-${t.id.toUpperCase()}`,
           ].join("\n");
+
+          const progressPct =
+            t.requiredPoints > 0
+              ? Math.min(100, (totalPoints / t.requiredPoints) * 100)
+              : 0;
 
           return (
             <div
@@ -277,24 +298,22 @@ export default function RewardsPage() {
                 <div className="mt-2 h-2 w-full rounded-full bg-zinc-900/10">
                   <div
                     className="h-2 rounded-full bg-zinc-900"
-                    style={{
-                      width: `${Math.min(100, (totalPoints / t.requiredPoints) * 100)}%`,
-                    }}
+                    style={{ width: `${progressPct}%` }}
                   />
                 </div>
 
                 <div className="mt-2 text-xs text-zinc-600">
-                  {walletAddress
-                    ? eligible
-                      ? "Eligible — copy claim info and submit to admins."
-                      : `Need ${fmtNumber(need)} pts more to unlock.`
-                    : "Connect wallet to compute eligibility."}
+                  {!hasWallet
+                    ? "Connect wallet to compute eligibility."
+                    : eligible
+                    ? "Eligible — copy claim info and submit to admins."
+                    : `Need ${fmtNumber(need)} pts to reach eligibility.`}
                 </div>
               </div>
 
               {/* Actions */}
               <div className="mt-4 flex flex-wrap gap-3">
-                {!walletAddress ? (
+                {!hasWallet ? (
                   <button
                     type="button"
                     onClick={connectWallet}
@@ -321,7 +340,7 @@ export default function RewardsPage() {
                     disabled
                     className="rounded-xl border border-zinc-900/10 bg-white/40 px-4 py-2 text-sm font-semibold text-zinc-400"
                   >
-                    Not unlocked yet
+                    Not eligible yet
                   </button>
                 )}
 
@@ -335,8 +354,8 @@ export default function RewardsPage() {
 
               {/* Manual claim note */}
               <div className="mt-4 text-xs text-zinc-600">
-                Manual distribution: admins will verify on-chain / wallet-based proof.{" "}
-                <b>No private keys</b> required.
+                Manual distribution: admins will verify on-chain / wallet-based
+                proof. <b>No private keys</b> required.
               </div>
             </div>
           );
@@ -347,7 +366,8 @@ export default function RewardsPage() {
       <div className="rounded-2xl border border-zinc-900/10 bg-white/70 p-5 text-sm text-zinc-700">
         <div className="font-semibold text-zinc-900">Safety</div>
         <div className="mt-2">
-          WAOC will <b>never</b> ask for seed phrases or private keys. Verify only via official links inside this site.
+          WAOC will <b>never</b> ask for seed phrases or private keys. Verify
+          only via official links inside this site.
         </div>
       </div>
     </div>
