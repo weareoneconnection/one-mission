@@ -7,6 +7,7 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 function num(v: any, d: number) {
+  if (v == null || v === "") return d;
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
 }
@@ -14,11 +15,13 @@ function num(v: any, d: number) {
 function pad2(n: number) {
   return String(n).padStart(2, "0");
 }
-function todayKey(d = new Date()) {
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
+// ✅ 统一：UTC 日/周 key
+function todayKeyUTC(d = new Date()) {
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
 }
-function isoWeekKey(date = new Date()) {
-  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+function isoWeekKeyUTC(date = new Date()) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
   const dayNum = d.getUTCDay() || 7; // Mon=1..Sun=7
   d.setUTCDate(d.getUTCDate() + 4 - dayNum); // Thu
   const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
@@ -28,10 +31,7 @@ function isoWeekKey(date = new Date()) {
 
 function noStoreJson(data: any) {
   const res = NextResponse.json(data);
-  res.headers.set(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate, proxy-revalidate"
-  );
+  res.headers.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.headers.set("Pragma", "no-cache");
   res.headers.set("Expires", "0");
   return res;
@@ -49,7 +49,6 @@ async function redisHGetInt(redis: any, key: string, field: string) {
     const n = Number(v ?? 0);
     return Number.isFinite(n) ? Math.trunc(n) : 0;
   }
-  // fallback: maybe stored as JSON string in GET
   const raw = await redis.get(key);
   if (!raw) return 0;
   try {
@@ -61,27 +60,26 @@ async function redisHGetInt(redis: any, key: string, field: string) {
   }
 }
 
-async function redisGetPointsForPeriod(redis: any, wallet: string, period: "all" | "daily" | "weekly") {
+async function redisGetPointsForPeriod(
+  redis: any,
+  wallet: string,
+  period: "all" | "daily" | "weekly"
+) {
   if (period === "all") {
-    // v2 preferred
     const v2 = await redisHGetInt(redis, `u:${wallet}:profile`, "points_total");
     if (v2) return v2;
-
-    // v1 fallback
     return await redisGetInt(redis, `u:${wallet}:points`);
   }
 
   if (period === "daily") {
-    const d = todayKey();
+    const d = todayKeyUTC();
     const k = `u:${wallet}:points:daily:${d}`;
-    // support both string or hash field "points"
     const v = await redis.get(k);
     if (v != null) return Math.trunc(Number(v) || 0);
     return await redisHGetInt(redis, k, "points");
   }
 
-  // weekly
-  const w = isoWeekKey();
+  const w = isoWeekKeyUTC();
   const k = `u:${wallet}:points:weekly:${w}`;
   const v = await redis.get(k);
   if (v != null) return Math.trunc(Number(v) || 0);
@@ -94,48 +92,74 @@ async function redisGetCompletedAll(redis: any, wallet: string) {
   return await redisGetInt(redis, `u:${wallet}:completed`);
 }
 
+async function redisGetUpdatedAt(redis: any, wallet: string) {
+  const v2 =
+    (await redisHGetInt(redis, `u:${wallet}:profile`, "updatedAt")) ||
+    (await redisHGetInt(redis, `u:${wallet}:profile`, "lastSeen")) ||
+    (await redisHGetInt(redis, `u:${wallet}:profile`, "last_active"));
+  return v2 || 0;
+}
+
 function zsetKey(sort: "points" | "completed", period: "all" | "daily" | "weekly") {
-  // ✅ new v2 keys
   if (sort === "points") {
-    if (period === "daily") return `leaderboard:points:daily:${todayKey()}`;
-    if (period === "weekly") return `leaderboard:points:weekly:${isoWeekKey()}`;
+    if (period === "daily") return `leaderboard:points:daily:${todayKeyUTC()}`;
+    if (period === "weekly") return `leaderboard:points:weekly:${isoWeekKeyUTC()}`;
     return "leaderboard:points:all";
   }
-
-  // completed：先只做总榜（后续你要也可扩展 daily/weekly）
   return "leaderboard:completed:all";
 }
 
 function legacyZsetKey(sort: "points" | "completed") {
-  // ✅ old v1 keys
   return sort === "completed" ? "leaderboard:completed" : "leaderboard:points";
+}
+
+async function zRangeCompat(redis: any, key: string, start: number, stop: number, rev: boolean) {
+  try {
+    return (await redis.zRange(key, start, stop, rev ? { REV: true } : undefined)) as string[];
+  } catch {
+    try {
+      return (await redis.zRange(key, start, stop, rev ? { rev: true } : undefined)) as string[];
+    } catch {
+      try {
+        return (await redis.zRange(key, start, stop, rev ? { reverse: true } : undefined)) as string[];
+      } catch {
+        if (rev && typeof redis.zRevRange === "function") {
+          return (await redis.zRevRange(key, start, stop)) as string[];
+        }
+        return (await redis.zRange(key, start, stop)) as string[];
+      }
+    }
+  }
 }
 
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
 
-    const sort = (url.searchParams.get("sort") || "points") as "points" | "completed";
-    const order = (url.searchParams.get("order") || "desc") as "asc" | "desc";
-    const limit = Math.max(1, Math.min(200, num(url.searchParams.get("limit"), 50)));
+    const sortRaw = (url.searchParams.get("sort") || "points").toLowerCase();
+    const sort = (sortRaw === "completed" ? "completed" : "points") as "points" | "completed";
+
+    const orderRaw = (url.searchParams.get("order") || "desc").toLowerCase();
+    const order = (orderRaw === "asc" ? "asc" : "desc") as "asc" | "desc";
+
+    // ✅ 默认 50；并 clamp 1..200
+    const limit = Math.max(1, Math.min(200, Math.trunc(num(url.searchParams.get("limit"), 200))));
+
     const wallet = (url.searchParams.get("wallet") || "").trim();
 
-    // ✅ NEW: period
-    const period = (url.searchParams.get("period") || "all") as "all" | "daily" | "weekly";
+    const periodRaw = (url.searchParams.get("period") || "all").toLowerCase();
     const safePeriod: "all" | "daily" | "weekly" =
-      period === "daily" || period === "weekly" ? period : "all";
+      periodRaw === "daily" || periodRaw === "weekly" ? (periodRaw as any) : "all";
 
     const driver = String(process.env.LEADERBOARD_STORE_DRIVER || "memory").toLowerCase();
     const rev = order === "desc";
 
     // =========================
-    // ✅ MEMORY (dev)
+    // MEMORY (dev)
     // =========================
     if (driver === "memory") {
       const rows = Array.from(memStore.leaderboardByWallet.values());
 
-      // Memory store 当前没分 period（你后面我们会在 claim 时一并写）
-      // 所以这里：period != all 时先回退 all（不影响本地开发）
       rows.sort((a, b) => {
         const av = sort === "completed" ? a.completed : a.points;
         const bv = sort === "completed" ? b.completed : b.points;
@@ -162,7 +186,8 @@ export async function GET(req: Request) {
         sort,
         order,
         period: safePeriod,
-        periodKey: safePeriod === "daily" ? todayKey() : safePeriod === "weekly" ? isoWeekKey() : "all",
+        periodKey:
+          safePeriod === "daily" ? todayKeyUTC() : safePeriod === "weekly" ? isoWeekKeyUTC() : "all",
         participants: rows.length,
         top1: top[0] ?? null,
         youRank,
@@ -173,14 +198,13 @@ export async function GET(req: Request) {
     }
 
     // =========================
-    // ✅ REDIS (KV)
+    // REDIS (KV)
     // =========================
     const redis = await getRedis();
 
     const zkeyV2 = zsetKey(sort, safePeriod);
     const zkeyV1 = legacyZsetKey(sort);
 
-    // 先尝试 v2 zset，如果不存在/为空则回退 v1
     let participants = Number((await redis.zCard(zkeyV2)) ?? 0);
     let zkeyInUse = zkeyV2;
 
@@ -188,22 +212,23 @@ export async function GET(req: Request) {
       const p1 = Number((await redis.zCard(zkeyV1)) ?? 0);
       if (p1 > 0) {
         participants = p1;
-        zkeyInUse = zkeyV1; // fallback old
+        zkeyInUse = zkeyV1;
       }
     }
 
-    const members = (await redis.zRange(zkeyInUse, 0, limit - 1, { REV: rev })) as string[];
+    const members = (await zRangeCompat(redis, zkeyInUse, 0, limit - 1, rev)) as string[];
 
     const rows = await Promise.all(
       members.map(async (w) => {
         const points =
           sort === "points"
             ? await redisGetPointsForPeriod(redis, w, safePeriod)
-            : await redisGetPointsForPeriod(redis, w, "all"); // completed榜也把 points 带上，便于展示
+            : await redisGetPointsForPeriod(redis, w, "all");
 
         const completed = await redisGetCompletedAll(redis, w);
+        const updatedAt = (await redisGetUpdatedAt(redis, w)) || 0;
 
-        return { wallet: w, points, completed, updatedAt: Date.now() };
+        return { wallet: w, points, completed, updatedAt };
       })
     );
 
@@ -221,8 +246,9 @@ export async function GET(req: Request) {
             : await redisGetPointsForPeriod(redis, wallet, "all");
 
         const completed = await redisGetCompletedAll(redis, wallet);
+        const updatedAt = (await redisGetUpdatedAt(redis, wallet)) || 0;
 
-        you = { wallet, points, completed, updatedAt: Date.now() };
+        you = { wallet, points, completed, updatedAt };
       }
     }
 
@@ -232,8 +258,9 @@ export async function GET(req: Request) {
       sort,
       order,
       period: safePeriod,
-      periodKey: safePeriod === "daily" ? todayKey() : safePeriod === "weekly" ? isoWeekKey() : "all",
-      zkey: zkeyInUse, // 方便你调试
+      periodKey:
+        safePeriod === "daily" ? todayKeyUTC() : safePeriod === "weekly" ? isoWeekKeyUTC() : "all",
+      zkey: zkeyInUse,
       participants,
       top1: rows[0] ?? null,
       youRank,
