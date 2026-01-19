@@ -4,7 +4,10 @@ import bs58 from "bs58";
 type VerifyType = "SOL" | "SPL" | "NFT_COLLECTION";
 
 type VerifyRequest = {
+  // ✅ 兼容前端可能传 wallet
   address?: string;
+  wallet?: string;
+
   verifyType?: VerifyType;
 
   // SOL
@@ -63,11 +66,7 @@ function isHeliusRpc(url: string) {
  * ✅ 通用 JSON-RPC
  * 关键：DAS 方法（getAssetsByOwner 等）要求 params 是 object，而不是 array
  */
-async function rpcCall<T>(
-  method: string,
-  params: any = [],
-  timeoutMs = 15000
-): Promise<T> {
+async function rpcCall<T>(method: string, params: any = [], timeoutMs = 15000): Promise<T> {
   if (!RPC_URL) throw new Error("SOLANA_RPC_URL not set.");
 
   const ctrl = new AbortController();
@@ -103,10 +102,7 @@ async function rpcCall<T>(
 }
 
 async function getSolBalanceSol(address: string) {
-  const result = await rpcCall<{ value: number }>("getBalance", [
-    address,
-    { commitment: "confirmed" },
-  ]);
+  const result = await rpcCall<{ value: number }>("getBalance", [address, { commitment: "confirmed" }]);
   return result.value / 1_000_000_000;
 }
 
@@ -129,11 +125,7 @@ async function getSplBalance(address: string, mint: string) {
         };
       };
     }>;
-  }>("getTokenAccountsByOwner", [
-    address,
-    { mint },
-    { encoding: "jsonParsed", commitment: "confirmed" },
-  ]);
+  }>("getTokenAccountsByOwner", [address, { mint }, { encoding: "jsonParsed", commitment: "confirmed" }]);
 
   let total = 0;
   let decimals = 0;
@@ -166,7 +158,6 @@ async function ownsNftInCollectionHeliusDAS(address: string, collectionMint: str
   return { owns: Boolean(hit), scanned: items.length };
 }
 
-
 // ---------- route ----------
 export async function POST(req: Request) {
   let body: VerifyRequest;
@@ -183,7 +174,9 @@ export async function POST(req: Request) {
   }
 
   const verifyType = body.verifyType as VerifyType;
-  const address = String(body.address || "").trim();
+
+  // ✅ 兼容：address / wallet 二选一
+  const address = String(body.address || body.wallet || "").trim();
 
   // verifyType check
   if (!verifyType || !["SOL", "SPL", "NFT_COLLECTION"].includes(verifyType)) {
@@ -203,6 +196,7 @@ export async function POST(req: Request) {
       verifyType,
       address,
       error: "Invalid wallet address",
+      details: { hint: "send {address} or {wallet}" },
     };
     return NextResponse.json(r, { status: 400 });
   }
@@ -229,7 +223,7 @@ export async function POST(req: Request) {
   }
 
   if (verifyType === "SPL") {
-    const mint = String((body.mint || WAOC_MINT || "")).trim();
+    const mint = String(body.mint || WAOC_MINT || "").trim();
     const minAmount = body.minAmount;
 
     if (!mint) {
@@ -253,7 +247,7 @@ export async function POST(req: Request) {
   }
 
   if (verifyType === "NFT_COLLECTION") {
-    const collectionMint = String((body.collectionMint || COLLECTION_MINT || "")).trim();
+    const collectionMint = String(body.collectionMint || COLLECTION_MINT || "").trim();
 
     if (!collectionMint) {
       return NextResponse.json(
@@ -314,7 +308,7 @@ export async function POST(req: Request) {
     }
 
     if (verifyType === "SPL") {
-      const mint = String((body.mint || WAOC_MINT || "")).trim();
+      const mint = String(body.mint || WAOC_MINT || "").trim();
       const minAmount = typeof body.minAmount === "number" ? body.minAmount : 10_000;
 
       const { total, decimals, accounts } = await getSplBalance(address, mint);
@@ -338,7 +332,7 @@ export async function POST(req: Request) {
     }
 
     if (verifyType === "NFT_COLLECTION") {
-      const collectionMint = String((body.collectionMint || COLLECTION_MINT || "")).trim();
+      const collectionMint = String(body.collectionMint || COLLECTION_MINT || "").trim();
 
       const { owns, scanned } = await ownsNftInCollectionHeliusDAS(address, collectionMint);
 

@@ -8,6 +8,13 @@ function pickDriver(): Driver {
   return v === "kv" ? "kv" : "memory";
 }
 
+function pad2(n: number) {
+  return String(n).padStart(2, "0");
+}
+function todayKeyUTC(d = new Date()) {
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
 // ---- memory store (dev) ----
 type MemDB = { kv: Map<string, any> };
 function getMemDB(): MemDB {
@@ -36,7 +43,6 @@ async function redisGetInt(redis: any, key: string) {
 
 async function redisHGet(redis: any, key: string, field: string) {
   if (typeof redis.hGet === "function") return await redis.hGet(key, field);
-  // fallback: some env stores json string
   const raw = await redis.get(key);
   if (!raw) return null;
   try {
@@ -53,10 +59,7 @@ export async function GET(req: Request) {
     const wallet = String(url.searchParams.get("wallet") || "").trim();
 
     if (!wallet) {
-      return NextResponse.json(
-        { ok: false, error: "missing wallet query (?wallet=...)" },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "missing wallet query (?wallet=...)" }, { status: 400 });
     }
 
     const driver = pickDriver();
@@ -71,7 +74,6 @@ export async function GET(req: Request) {
     if (driver === "kv") {
       const redis = await kvClient();
 
-      // ✅ prefer v2 profile totals; fallback legacy
       const points_total = asInt(await redisHGet(redis, kProfile, "points_total"), 0);
       const completed_total = asInt(await redisHGet(redis, kProfile, "completed_total"), 0);
       const unique_once_total = asInt(await redisHGet(redis, kProfile, "unique_once_total"), 0);
@@ -86,21 +88,17 @@ export async function GET(req: Request) {
       const points = points_total || legacyPoints;
       const completed = completed_total || legacyCompleted;
 
-      // ✅ 兼容前端：同时给 points & totalPoints；completed & completedCount
       return NextResponse.json({
         ok: true,
         wallet,
         driver,
 
-        // legacy-compatible
         points,
         completed,
 
-        // compatibility aliases (your store.ts supports these)
         totalPoints: points,
         completedCount: completed,
 
-        // ✅ new metrics
         uniqueCompleted: unique_once_total,
         completedMeaning: "total_claims",
         uniqueMeaning: "unique_once",
@@ -108,14 +106,14 @@ export async function GET(req: Request) {
         streak: {
           count: streak_count,
           lastDate: streak_last_date,
-          active: Boolean(streak_last_date) && streak_last_date === new Date().toISOString().slice(0, 10),
+          active: Boolean(streak_last_date) && streak_last_date === todayKeyUTC(),
         },
 
         updatedAt,
       });
     }
 
-    // ---- memory driver ----
+    // memory driver
     const profile = (await memGet(kProfile)) ?? {};
     const points_total = asInt(profile?.points_total, 0);
     const completed_total = asInt(profile?.completed_total, 0);
@@ -149,15 +147,12 @@ export async function GET(req: Request) {
       streak: {
         count: streak_count,
         lastDate: streak_last_date,
-        active: Boolean(streak_last_date) && streak_last_date === new Date().toISOString().slice(0, 10),
+        active: Boolean(streak_last_date) && streak_last_date === todayKeyUTC(),
       },
 
       updatedAt,
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: e?.message ?? "stats_error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: e?.message ?? "stats_error" }, { status: 500 });
   }
 }

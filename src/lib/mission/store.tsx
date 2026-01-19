@@ -14,6 +14,11 @@ import { verifyOnchainMission } from "@/lib/onchain/verifyOnchain";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 
+type ProofPayload = {
+  text?: string; // 用户描述
+  url?: string;  // 证明链接（tweet / tg msg / github / etc）
+};
+
 type MissionState = {
   missions: Mission[];
   points: number;
@@ -28,7 +33,10 @@ type MissionState = {
   verifyingId: string | null;
   errors: Record<string, string | undefined>;
 
-  verify: (id: string) => void;
+  // ✅ 兼容：仍然可以 verify(id)
+  // ✅ 新增：verify(id, proof)
+  verify: (id: string, proof?: ProofPayload) => void;
+
   reset: () => void;
   resetAll: () => void;
 };
@@ -36,29 +44,23 @@ type MissionState = {
 const MissionContext = createContext<MissionState | null>(null);
 
 // ✅ 任务定义（不写 completed）
-// status: completed -> available（由“本周期是否已领”决定）
 const baseMissions: Mission[] = mockMissions.map((m) => ({
   ...m,
   status: m.status === "completed" ? "available" : m.status,
 }));
 
 /** -----------------------------
- *  Response Types (兼容字段)
+ *  Response Types
  * ------------------------------ */
 type StatsResponse = {
   ok: boolean;
   wallet: string;
-
-  // legacy compatibility
   points?: number;
   totalPoints?: number;
   completed?: number;
   completedCount?: number;
-
-  // new shape compatibility (如果你后端已经升级成更丰富结构，也能吃)
   points_total?: number;
   completed_total?: number;
-
   error?: string;
 };
 
@@ -66,18 +68,23 @@ type VerifyResponse = {
   ok: boolean;
   wallet: string;
   missionId: string;
-
   points?: number;
   totalPoints?: number;
-
   completed?: number;
   completedCount?: number;
-
   duplicated?: boolean;
   alreadyVerified?: boolean;
-
   pointsAdded?: number;
+  error?: string;
+};
 
+type SubmitResponse = {
+  ok: boolean;
+  wallet: string;
+  missionId: string;
+  period?: "once" | "daily" | "weekly";
+  periodKey?: string;
+  queued?: boolean;
   error?: string;
 };
 
@@ -138,24 +145,27 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
     [publicKey]
   );
 
-  // ✅ 权威 stats：来自后端
+  // ✅ stats：来自后端
   const [statsByWallet, setStatsByWallet] = useState<
     Record<string, { points: number; completed: number }>
   >({});
 
-  // ✅ 本周期“已领”状态：来自 ledger(history) 推导
+  // ✅ 已领状态：来自 ledger(history)
   const [claimsByWallet, setClaimsByWallet] = useState<
     Record<
       string,
       {
         todayKey: string;
         weekKey: string;
-        daily: string[];  // missionId list claimed today
-        weekly: string[]; // missionId list claimed this week
-        once: string[];   // missionId list claimed ever (once missions)
+        daily: string[];
+        weekly: string[];
+        once: string[];
       }
     >
   >({});
+
+  // ✅ 本地 pending（用于：提交后立刻显示“等待审核”，无需等 refresh/history）
+  const [pendingByWallet, setPendingByWallet] = useState<Record<string, string[]>>({});
 
   const [verifyingId, setVerifyingId] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string | undefined>>({});
@@ -175,6 +185,18 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
     return claimsByWallet[walletAddress] ?? null;
   }, [claimsByWallet, walletAddress]);
 
+  const pendingIds = useMemo(() => {
+    if (!walletAddress) return [];
+    return pendingByWallet[walletAddress] ?? [];
+  }, [pendingByWallet, walletAddress]);
+
+  // ✅ “是否走人工审核”的规则（你可以按自己任务体系微调）
+  // 推荐：非 onchain 的任务都走 submit + admin approve
+  function shouldUseAdminReview(m: Mission) {
+    const isOnchain = Boolean((m as any).onchain);
+    return !isOnchain; // ✅ 非链上任务走人工审核
+  }
+
   const missions = useMemo(() => {
     const today = todayKeyUTC();
     const week = isoWeekKeyUTC();
@@ -184,15 +206,17 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
 
       const period = parseMissionPeriod(m.id);
 
+      // ✅ pending 优先：提交后立刻显示等待审核
+      const isPending = walletAddress ? pendingIds.includes(m.id) : false;
+      if (isPending) return { ...m, status: "cooldown" as const };
+
       const isVerifying = walletAddress ? verifyingId === m.id : false;
       if (isVerifying) return { ...m, status: "cooldown" as const };
 
       if (!walletAddress) return { ...m, status: "available" as const };
 
-      // If we haven't loaded claims yet, keep available (no flicker to completed)
       if (!claims) return { ...m, status: "available" as const };
 
-      // If date/week rolled, treat as empty until refreshed
       const claimsToday = claims.todayKey === today ? claims.daily : [];
       const claimsWeek = claims.weekKey === week ? claims.weekly : [];
 
@@ -205,7 +229,7 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
       if (isClaimed) return { ...m, status: "completed" as const };
       return { ...m, status: "available" as const };
     });
-  }, [claims, verifyingId, walletAddress]);
+  }, [claims, verifyingId, walletAddress, pendingIds]);
 
   const connectWallet = async () => setVisible(true);
 
@@ -241,12 +265,10 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
       } else if (period === "weekly") {
         if (it.periodKey === week) weekly.push(mid);
       } else {
-        // once
         once.push(mid);
       }
     }
 
-    // de-dup
     const uniq = (arr: string[]) => Array.from(new Set(arr));
 
     setClaimsByWallet((prev) => ({
@@ -261,7 +283,27 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
     }));
   };
 
-  /** ✅ 拉 stats + history（一次拉齐，避免状态不一致） */
+  // ✅ 如果 ledger 已经出现了该任务，就把本地 pending 清掉
+  const clearPendingIfClaimed = (wallet: string) => {
+    const c = claimsByWallet[wallet];
+    if (!c) return;
+
+    const today = todayKeyUTC();
+    const week = isoWeekKeyUTC();
+
+    const claimed = new Set<string>();
+    if (c.todayKey === today) c.daily.forEach((x) => claimed.add(x));
+    if (c.weekKey === week) c.weekly.forEach((x) => claimed.add(x));
+    c.once.forEach((x) => claimed.add(x));
+
+    setPendingByWallet((prev) => {
+      const cur = prev[wallet] ?? [];
+      const next = cur.filter((id) => !claimed.has(id));
+      return { ...prev, [wallet]: next };
+    });
+  };
+
+  /** ✅ 拉 stats + history */
   const refreshAll = async (wallet: string) => {
     if (!wallet) return;
 
@@ -273,31 +315,24 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
 
     const s = (await r1.json().catch(() => ({}))) as StatsResponse;
     if (r1.ok && s?.ok) {
-      const nextPoints = pickNumber(
-        s.totalPoints,
-        s.points,
-        s.points_total
-      );
-      const nextCompleted = pickNumber(
-        s.completed,
-        s.completedCount,
-        s.completed_total
-      );
+      const nextPoints = pickNumber(s.totalPoints, s.points, s.points_total);
+      const nextCompleted = pickNumber(s.completed, s.completedCount, s.completed_total);
       setStatsForWallet(wallet, nextPoints, nextCompleted);
     }
 
-    // 2) history / ledger -> determine per-period claimed status
+    // 2) history
     const r2 = await fetch(
-      `/api/mission/history?wallet=${encodeURIComponent(wallet)}&limit=200`,
+      `/api/mission/history?wallet=${encodeURIComponent(wallet)}&limit=1000`,
       { method: "GET", cache: "no-store" }
     );
     const h = (await r2.json().catch(() => ({}))) as HistoryResponse;
     if (r2.ok && h?.ok && Array.isArray(h.items)) {
       setClaimsForWalletFromLedger(wallet, h.items);
+      // ✅ 让 pending 能自动消失
+      setTimeout(() => clearPendingIfClaimed(wallet), 0);
     }
   };
 
-  // ✅ wallet 变化自动刷新
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -305,9 +340,7 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
       try {
         await refreshAll(walletAddress);
         if (cancelled) return;
-      } catch {
-        // ignore
-      }
+      } catch {}
     })();
 
     return () => {
@@ -315,7 +348,7 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
     };
   }, [walletAddress]);
 
-  // ✅ 写后端（长期周期版）
+  // ✅ 自动记分（旧 verify）
   async function postVerifyToServer(wallet: string, mission: Mission) {
     const r = await fetch("/api/mission/verify", {
       method: "POST",
@@ -334,7 +367,29 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
     return j;
   }
 
-  const verify = (id: string) => {
+  // ✅ 新增：提交审核（proof 入队）
+  async function postSubmitToServer(wallet: string, mission: Mission, proof?: ProofPayload) {
+    const r = await fetch("/api/mission/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        wallet,
+        missionId: mission.id,
+        // 你 submit 接口如果需要 periodKey，这里也可以一起传
+        proof: {
+          text: String(proof?.text || "").trim(),
+          url: String(proof?.url || "").trim(),
+        },
+      }),
+    });
+
+    const j = (await r.json().catch(() => ({}))) as SubmitResponse;
+    if (!r.ok || !j?.ok) throw new Error(j?.error || "Submit failed.");
+    return j;
+  }
+
+  const verify = (id: string, proof?: ProofPayload) => {
     (async () => {
       const m = baseMissions.find((x) => x.id === id);
       if (!m) return;
@@ -350,7 +405,7 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // ✅ “是否已领”以 ledger 推导为准（daily/weekly 只在本周期有效）
+      // ✅ 已领直接返回
       const period = parseMissionPeriod(id);
       const today = todayKeyUTC();
       const week = isoWeekKeyUTC();
@@ -375,7 +430,7 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
       setVerifyingId(id);
 
       try {
-        // 1) onchain 任务先校验
+        // 1) onchain 先校验
         if (isOnchain) {
           const res = await verifyOnchainMission(m, walletAddress);
           if (!res.ok) {
@@ -387,17 +442,37 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
-        // 2) 写入后端积分（支持 daily/weekly/once）
+        // 2) 决定走审核还是直接记分
+        if (shouldUseAdminReview(m)) {
+          await postSubmitToServer(walletAddress, m, proof);
+
+          // ✅ 立刻 pending（不用等刷新）
+          setPendingByWallet((prev) => {
+            const cur = prev[walletAddress] ?? [];
+            if (cur.includes(id)) return prev;
+            return { ...prev, [walletAddress]: [id, ...cur] };
+          });
+
+          // ✅ 给用户即时反馈（MissionCard 会把它显示成“Submitted”样式）
+          setErrors((prev) => ({
+            ...prev,
+            [id]: "Submitted. Waiting for admin approval.",
+          }));
+
+          // 可选：刷新一下（但即使不刷新，pending 也会显示）
+          await refreshAll(walletAddress);
+          return;
+        }
+
+        // 3) 直接记分（保留能力）
         const j = await postVerifyToServer(walletAddress, m);
 
-        // 3) 局部更新 stats（可选），最终以 refreshAll 为准
         const nextPoints = pickNumber(j.totalPoints, j.points);
         const nextCompleted = pickNumber(j.completed, j.completedCount);
         if (nextPoints || nextCompleted) {
           setStatsForWallet(walletAddress, nextPoints, nextCompleted);
         }
 
-        // 4) 强制刷新（拿到最新 ledger -> 更新“本周期已领”）
         await refreshAll(walletAddress);
       } catch (e: any) {
         setErrors((prev) => ({
@@ -410,7 +485,6 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
     })();
   };
 
-  // ✅ 本地 reset（不影响后端）
   const reset = () => {
     if (!walletAddress) return;
     setClaimsByWallet((prev) => {
@@ -423,6 +497,11 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
       delete next[walletAddress];
       return next;
     });
+    setPendingByWallet((prev) => {
+      const next = { ...prev };
+      delete next[walletAddress];
+      return next;
+    });
     setErrors({});
     setVerifyingId(null);
   };
@@ -430,6 +509,7 @@ export function MissionProvider({ children }: { children: React.ReactNode }) {
   const resetAll = () => {
     setClaimsByWallet({});
     setStatsByWallet({});
+    setPendingByWallet({});
     setErrors({});
     setVerifyingId(null);
   };

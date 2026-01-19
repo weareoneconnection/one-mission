@@ -83,7 +83,7 @@ function OnchainInfo({ mission }: { mission: Mission }) {
   return null;
 }
 
-// ---- periodKey (跟你 store 里 UTC 一致，避免 daily/weekly 错位) ----
+// ---- periodKey (UTC) ----
 function pad2(n: number) {
   return String(n).padStart(2, "0");
 }
@@ -114,8 +114,6 @@ async function fileToDataUrl(file: File) {
   return `data:${file.type};base64,${base64}`;
 }
 
-type VerifyType = "SOL" | "SPL" | "NFT_COLLECTION";
-
 export default function MissionCard({
   mission,
   onVerify,
@@ -127,8 +125,6 @@ export default function MissionCard({
   const err = errors[mission.id];
 
   const [dismissedError, setDismissedError] = useState(false);
-
-  // ✅ 本地错误（用于接住 verify-onchain 的真实 HTTP 状态和 error）
   const [localErr, setLocalErr] = useState<string | null>(null);
 
   const period = useMemo(() => parsePeriod(mission.id), [mission.id]);
@@ -137,11 +133,9 @@ export default function MissionCard({
   const isCompleted = mission.status === "completed";
   const isVerifying = mission.status === "cooldown" || verifyingId === mission.id;
 
-  // ✅ 判断是否需要人工审核（你可按你的 mission 配置改规则）
-  // 规则：非 onchain 且 非“自动claim”的任务，都走 submit proof
+  // 非 onchain 且 非自动claim -> proof
   const requiresProof = Boolean((mission as any).requiresProof) || !Boolean((mission as any).onchain);
 
-  // ✅ 本地 pending：提交后给用户一个“等待审核”的明确状态
   const [pending, setPending] = useState(false);
   const pendingKey = useMemo(() => {
     const pk = periodKeyFor(period);
@@ -166,7 +160,6 @@ export default function MissionCard({
 
   const badgeStatus = statusLabel(mission.status, period, pending);
 
-  // CTA label
   const ctaLabel = pending
     ? "Waiting for admin"
     : isVerifying
@@ -244,11 +237,9 @@ export default function MissionCard({
       const j = await r.json().catch(() => ({} as any));
       if (!r.ok || !j?.ok) throw new Error(j?.error || `Submit failed (HTTP ${r.status})`);
 
-      // ✅ 立即进入 pending 状态（不等 admin）
       if (pendingKey) sessionStorage.setItem(pendingKey, "1");
       setPending(true);
 
-      // reset + close
       setProofUrl("");
       setNote("");
       setFiles([]);
@@ -260,50 +251,41 @@ export default function MissionCard({
     }
   }
 
-  // ✅ Onchain verify (对齐后端 /api/verify-onchain: verifyType + address)
-  async function verifyOnchain() {
+  /**
+   * ✅ Onchain one-step: call YOUR /api/mission/verify (the code you pasted)
+   * It will do:
+   *  - dedup by period
+   *  - verifyOnchainMission(...)
+   *  - apply points/leaderboard/ledger
+   */
+  async function claimOnchainViaVerifyRoute() {
     if (!walletAddress) return;
 
-    const oc: any = (mission as any).onchain;
-    const kind = String(oc?.kind || "").toLowerCase();
+    const pk = periodKeyFor(period);
 
-    let verifyType: VerifyType = "SPL";
-    const payload: any = { address: walletAddress };
-
-    if (kind === "sol") {
-      verifyType = "SOL";
-      const lamports = typeof oc?.minLamports === "number" ? oc.minLamports : 100_000_000; // default 0.1 SOL
-      payload.minSol = lamports / 1_000_000_000;
-    } else if (kind === "spl") {
-      verifyType = "SPL";
-      payload.minAmount = typeof oc?.minAmount === "number" ? oc.minAmount : 10_000;
-      // mint 可不传，后端会 fallback 到 WAOC_MINT
-      // payload.mint = oc?.mint;
-    } else if (kind === "nft") {
-      verifyType = "NFT_COLLECTION";
-      // collectionMint 可不传，后端会 fallback 到 WAOC_GENESIS_COLLECTION_MINT
-      // payload.collectionMint = oc?.collectionMint;
-    } else {
-      // 没有 kind 的情况下，默认当作 SPL 10000
-      verifyType = "SPL";
-      payload.minAmount = 10_000;
-    }
-
-    const r = await fetch("/api/verify-onchain", {
+    const r = await fetch("/api/mission/verify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       cache: "no-store",
-      body: JSON.stringify({ verifyType, ...payload }),
+      body: JSON.stringify({
+        missionId: mission.id,
+        wallet: walletAddress,
+        walletAddress,
+        address: walletAddress,
+        points: mission.basePoints,
+        basePoints: mission.basePoints,
+        // 传不传 periodKey 都行，你后端自己算；这里带上更利于你排查
+        periodKey: pk,
+      }),
     });
 
     const j = await r.json().catch(() => ({} as any));
-
     if (!r.ok || !j?.ok) {
       throw new Error(j?.error ? `${j.error} (HTTP ${r.status})` : `HTTP ${r.status}`);
     }
 
-    // ✅ 成功后，交给外层刷新（不改变结构）
-    onVerify();
+    // ✅ 最稳：避免外层 onVerify 触发旧逻辑再次打 /api/mission/verify(旧版)/401
+    window.location.reload();
   }
 
   return (
@@ -361,20 +343,17 @@ export default function MissionCard({
 
                 if (!walletAddress) return;
 
-                // ✅ 需要 proof 的走弹窗，不走 verify
                 if (requiresProof) {
                   setOpen(true);
                   return;
                 }
 
-                // ✅ onchain 任务：直接调用 verify-onchain（对齐后端参数）
                 const isOnchain = Boolean((mission as any).onchain);
 
                 try {
                   if (isOnchain) {
-                    await verifyOnchain();
+                    await claimOnchainViaVerifyRoute();
                   } else {
-                    // ✅ 非 onchain 且不需要 proof：保持原结构（交给外层）
                     onVerify();
                   }
                 } catch (e: any) {
@@ -416,7 +395,10 @@ export default function MissionCard({
       {/* Proof Modal */}
       {open ? (
         <div className="fixed inset-0 z-[60] flex items-center justify-center px-4">
-          <div className="absolute inset-0 bg-black/30 backdrop-blur-[2px]" onClick={() => (submitting ? null : setOpen(false))} />
+          <div
+            className="absolute inset-0 bg-black/30 backdrop-blur-[2px]"
+            onClick={() => (submitting ? null : setOpen(false))}
+          />
           <div className="relative w-full max-w-2xl rounded-[28px] border border-zinc-900/10 bg-[#fbfaf7] shadow-2xl overflow-hidden">
             <div className="flex items-start justify-between gap-4 p-6">
               <div className="min-w-0">
@@ -437,7 +419,6 @@ export default function MissionCard({
             </div>
 
             <div className="px-6 pb-6 space-y-5">
-              {/* Proof link */}
               <div className="space-y-2">
                 <div className="text-sm font-semibold text-zinc-900">
                   Proof link <span className="text-zinc-500 font-normal">(recommended)</span>
@@ -451,7 +432,6 @@ export default function MissionCard({
                 <div className="text-xs text-zinc-500">Paste a link that proves you did it (tweet / TG message / repo / etc).</div>
               </div>
 
-              {/* Upload */}
               <div className="space-y-2">
                 <div className="text-sm font-semibold text-zinc-900">
                   Screenshot <span className="text-zinc-500 font-normal">(optional)</span>
@@ -484,7 +464,6 @@ export default function MissionCard({
                 ) : null}
               </div>
 
-              {/* Notes */}
               <div className="space-y-2">
                 <div className="text-sm font-semibold text-zinc-900">
                   Notes <span className="text-zinc-500 font-normal">(optional)</span>
@@ -531,3 +510,4 @@ export default function MissionCard({
     </div>
   );
 }
+

@@ -56,7 +56,9 @@ export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
     const wallet = String(url.searchParams.get("wallet") || "").trim();
-    const limit = Math.max(1, Math.min(500, num(url.searchParams.get("limit"), 200)));
+
+    // ✅ 上限提升到 1000（前端可传更大，但这里会 clamp）
+    const limit = Math.max(1, Math.min(1000, num(url.searchParams.get("limit"), 200)));
 
     if (!wallet) {
       return noStoreJson({ ok: false, error: "missing wallet query (?wallet=...)" });

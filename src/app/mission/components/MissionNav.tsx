@@ -4,13 +4,16 @@ import React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-const tabs = [
-  { href: "/", label: "Home" }, // ✅ 新增
+const baseTabs = [
+  { href: "/", label: "Home" },
   { href: "/mission/overview", label: "Overview" },
   { href: "/mission/missions", label: "Missions" },
   { href: "/mission/leaderboard", label: "Leaderboard" },
   { href: "/mission/rewards", label: "Rewards" },
   { href: "/mission/profile", label: "Profile" },
+
+  // ✅ Admin 直接作为普通 tab（按你要求）
+  { href: "/mission/admin", label: "Admin" },
 ];
 
 function isActive(pathname: string, href: string) {
@@ -23,7 +26,7 @@ export default function MissionNav() {
 
   return (
     <nav className="flex flex-wrap gap-2">
-      {tabs.map((t) => {
+      {baseTabs.map((t) => {
         const active = isActive(pathname, t.href);
 
         return (
