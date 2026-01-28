@@ -49,21 +49,34 @@ function copyToClipboard(s: string) {
   } catch {}
 }
 
-async function adminHeaders(walletAddress: string, signMessage: any) {
-  const nonce = crypto.getRandomValues(new Uint32Array(4)).join("-");
-  const ts = Date.now();
-  const msg = `WAOC_ONE_MISSION_ADMIN|wallet=${walletAddress}|nonce=${nonce}|ts=${ts}`;
-  const data = new TextEncoder().encode(msg);
+// ✅ 关键：完全按后端 verifyAdminSignature 的规则来
+// 后端要求：
+// - headers: x-admin-wallet / x-admin-timestamp / x-admin-msg / x-admin-signature
+// - msg 必须 === "POST:/api/mission/approve"
+// - payload = `${msg}|${ts}`
+// - signature 是对 payload 的 bytes 做签名，然后 bs58 encode
+async function adminHeaders(
+  walletAddress: string,
+  signMessage: any,
+  action: string = "POST:/api/mission/approve" // ✅ 默认不破坏你其他调用
+) {
+  const ts = String(Date.now());
+  const msg = action; // ✅ 改成可传入
+
+  const payload = `${msg}|${ts}`;
+  const data = new TextEncoder().encode(payload);
   const sigBytes = await signMessage(data);
   const { default: bs58 } = await import("bs58");
   const sig = bs58.encode(sigBytes);
 
   return {
     "x-admin-wallet": walletAddress,
+    "x-admin-timestamp": ts,
     "x-admin-msg": msg,
-    "x-admin-sig": sig,
+    "x-admin-signature": sig,
   };
 }
+
 
 function isHttpUrl(s: string) {
   return /^https?:\/\//i.test(s);
@@ -138,7 +151,11 @@ export default function AdminPage() {
 
   const checkAdminSession = async () => {
     try {
-      const r = await fetch("/api/mission/admin/session", { method: "GET", cache: "no-store" });
+      const r = await fetch("/api/mission/admin/session", {
+        method: "GET",
+        cache: "no-store",
+        credentials: "include",
+      });
       const j = await r.json().catch(() => ({}));
       if (r.ok && j?.ok) setAdminSession({ ok: true, wallet: j.wallet });
       else setAdminSession({ ok: false });
@@ -154,12 +171,13 @@ export default function AdminPage() {
 
     setLoading(true);
     try {
-      const headers = await adminHeaders(walletAddress, signMessage);
+      const headers = await adminHeaders(walletAddress, signMessage, "POST:/api/mission/admin/session");
 
       const r = await fetch("/api/mission/admin/session", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...headers },
         cache: "no-store",
+        credentials: "include",
         body: JSON.stringify({}),
       });
 
@@ -178,9 +196,11 @@ export default function AdminPage() {
     setErr("");
     setLoading(true);
     try {
-      await fetch("/api/mission/admin/session", { method: "DELETE", cache: "no-store" }).catch(
-        () => {}
-      );
+      await fetch("/api/mission/admin/session", {
+        method: "DELETE",
+        cache: "no-store",
+        credentials: "include",
+      }).catch(() => {});
     } finally {
       setAdminSession({ ok: false });
       setLoading(false);
@@ -203,6 +223,7 @@ export default function AdminPage() {
       const r = await fetch(`/api/mission/pending?limit=${lim}&slim=1`, {
         method: "GET",
         cache: "no-store",
+        credentials: "include",
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j?.ok) return setErr(j?.error || `Request failed (${r.status})`);
@@ -238,6 +259,7 @@ export default function AdminPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
+        credentials: "include",
         body: JSON.stringify({
           submissionId: sid,
           note: "approved_by_admin",
@@ -279,6 +301,7 @@ export default function AdminPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
+        credentials: "include",
         body: JSON.stringify({
           submissionId: sid,
           reason,
@@ -562,10 +585,16 @@ export default function AdminPage() {
                                 }
                               >
                                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                                <img src={img.url} alt={img.name || "proof"} className="h-24 w-full rounded-xl object-cover" />
+                                <img
+                                  src={img.url}
+                                  alt={img.name || "proof"}
+                                  className="h-24 w-full rounded-xl object-cover"
+                                />
                                 <div className="mt-2 truncate text-[11px] text-zinc-600">
                                   {img.name || "image"}{" "}
-                                  {img.size ? <span className="text-zinc-400">({Math.round(img.size / 1024)}KB)</span> : null}
+                                  {img.size ? (
+                                    <span className="text-zinc-400">({Math.round(img.size / 1024)}KB)</span>
+                                  ) : null}
                                 </div>
                               </button>
                             ))}

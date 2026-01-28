@@ -1,0 +1,403 @@
+{
+  "accounts": [
+    {
+      "discriminator": [
+        35,
+        224,
+        172,
+        211,
+        141,
+        49,
+        62,
+        193
+      ],
+      "name": "PointsAccount"
+    },
+    {
+      "discriminator": [
+        224,
+        166,
+        24,
+        118,
+        139,
+        55,
+        141,
+        239
+      ],
+      "name": "PointsConfig"
+    }
+  ],
+  "address": "9h862KFbMcoTdvwUZigRSshoWp3E9rGgcoKg1aAxCwuW",
+  "errors": [
+    {
+      "code": 6000,
+      "msg": "Unauthorized",
+      "name": "Unauthorized"
+    },
+    {
+      "code": 6001,
+      "msg": "Invalid amount",
+      "name": "InvalidAmount"
+    },
+    {
+      "code": 6002,
+      "msg": "Overflow",
+      "name": "Overflow"
+    },
+    {
+      "code": 6003,
+      "msg": "Owner mismatch",
+      "name": "OwnerMismatch"
+    }
+  ],
+  "instructions": [
+    {
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  105,
+                  110,
+                  116,
+                  115,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "points",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  105,
+                  110,
+                  116,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "docs": [
+            "No data is read or written, and ownership is enforced by `points.owner == owner.key()`."
+          ],
+          "name": "owner"
+        },
+        {
+          "docs": [
+            "authority：要么 admin signer，要么 mission signer PDA（必须 signer）"
+          ],
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "discriminator": [
+        59,
+        82,
+        226,
+        114,
+        188,
+        88,
+        181,
+        51
+      ],
+      "docs": [
+        "加分：必须满足其一",
+        "- admin 签名（admin == config.admin）",
+        "- 或 mission_signer 签名（由 mission program 的 PDA 签名，且与 config.mission_program_id 匹配）"
+      ],
+      "name": "add_points"
+    },
+    {
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  105,
+                  110,
+                  116,
+                  115,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "payer",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "mission_program_id",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ],
+      "discriminator": [
+        208,
+        127,
+        21,
+        1,
+        194,
+        190,
+        196,
+        70
+      ],
+      "docs": [
+        "全局配置：admin +（可选）mission_program_id"
+      ],
+      "name": "initialize_config"
+    },
+    {
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  105,
+                  110,
+                  116,
+                  115,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "points",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  105,
+                  110,
+                  116,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "system_program"
+        }
+      ],
+      "args": [],
+      "discriminator": [
+        128,
+        109,
+        193,
+        180,
+        6,
+        242,
+        202,
+        244
+      ],
+      "docs": [
+        "用户自己初始化 points 账户"
+      ],
+      "name": "initialize_points"
+    },
+    {
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  105,
+                  110,
+                  116,
+                  115,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "mission_program_id",
+          "type": "pubkey"
+        }
+      ],
+      "discriminator": [
+        25,
+        167,
+        24,
+        121,
+        134,
+        109,
+        239,
+        158
+      ],
+      "docs": [
+        "仅 admin 可更新 mission_program_id（为未来 Mission CPI 准备）"
+      ],
+      "name": "set_mission_program"
+    }
+  ],
+  "metadata": {
+    "description": "WAOC Points Program",
+    "name": "waoc_points",
+    "spec": "0.1.0",
+    "version": "0.1.0"
+  },
+  "types": [
+    {
+      "name": "PointsAccount",
+      "type": {
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_points",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
+            "name": "updated_at",
+            "type": "i64"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "PointsConfig",
+      "type": {
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "mission_program_id",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
+            "name": "updated_at",
+            "type": "i64"
+          }
+        ],
+        "kind": "struct"
+      }
+    }
+  ]
+}

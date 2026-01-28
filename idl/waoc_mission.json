@@ -1,0 +1,276 @@
+{
+  "accounts": [
+    {
+      "discriminator": [
+        252,
+        76,
+        10,
+        44,
+        64,
+        206,
+        105,
+        135
+      ],
+      "name": "MissionSigner"
+    },
+    {
+      "discriminator": [
+        35,
+        224,
+        172,
+        211,
+        141,
+        49,
+        62,
+        193
+      ],
+      "name": "PointsAccount"
+    },
+    {
+      "discriminator": [
+        224,
+        166,
+        24,
+        118,
+        139,
+        55,
+        141,
+        239
+      ],
+      "name": "PointsConfig"
+    }
+  ],
+  "address": "GfRRu9Rrhx7d25gmQYpkabX3Y6vvKP2KG8ejw7zJ1PJK",
+  "errors": [
+    {
+      "code": 6000,
+      "msg": "Unauthorized",
+      "name": "Unauthorized"
+    },
+    {
+      "code": 6001,
+      "msg": "Invalid amount",
+      "name": "InvalidAmount"
+    }
+  ],
+  "instructions": [
+    {
+      "accounts": [
+        {
+          "address": "9h862KFbMcoTdvwUZigRSshoWp3E9rGgcoKg1aAxCwuW",
+          "docs": [
+            "CPI 目标 program"
+          ],
+          "name": "waoc_points_program"
+        },
+        {
+          "docs": [
+            "✅ 不在 Mission 校验 seeds",
+            "👉 交给 waoc_points 自己校验"
+          ],
+          "name": "points_config"
+        },
+        {
+          "docs": [
+            "✅ 不在 Mission 校验 seeds"
+          ],
+          "name": "points",
+          "writable": true
+        },
+        {
+          "name": "owner"
+        },
+        {
+          "docs": [
+            "Mission signer PDA（唯一 signer）"
+          ],
+          "name": "mission_signer",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  105,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110,
+                  95,
+                  115,
+                  105,
+                  103,
+                  110,
+                  101,
+                  114
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "docs": [
+            "MVP：admin gate"
+          ],
+          "name": "admin",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "discriminator": [
+        7,
+        146,
+        136,
+        192,
+        102,
+        71,
+        93,
+        106
+      ],
+      "docs": [
+        "2️⃣ Mission → CPI → waoc_points.add_points",
+        "MVP 版本：仅允许 points_config.admin 触发"
+      ],
+      "name": "award_points"
+    },
+    {
+      "accounts": [
+        {
+          "name": "mission_signer",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  105,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110,
+                  95,
+                  115,
+                  105,
+                  103,
+                  110,
+                  101,
+                  114
+                ]
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "payer",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "system_program"
+        }
+      ],
+      "args": [],
+      "discriminator": [
+        102,
+        9,
+        69,
+        209,
+        147,
+        4,
+        185,
+        82
+      ],
+      "docs": [
+        "1️⃣ 初始化 mission signer PDA（只需一次）"
+      ],
+      "name": "init_mission_signer"
+    }
+  ],
+  "metadata": {
+    "description": "Created with Anchor",
+    "name": "waoc_mission",
+    "spec": "0.1.0",
+    "version": "0.1.0"
+  },
+  "types": [
+    {
+      "name": "MissionSigner",
+      "type": {
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "PointsAccount",
+      "type": {
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_points",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
+            "name": "updated_at",
+            "type": "i64"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "PointsConfig",
+      "type": {
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "mission_program_id",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
+            "name": "updated_at",
+            "type": "i64"
+          }
+        ],
+        "kind": "struct"
+      }
+    }
+  ]
+}

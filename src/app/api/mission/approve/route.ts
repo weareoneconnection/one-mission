@@ -1,4 +1,5 @@
 // src/app/api/mission/approve/route.ts
+import { awardPointsOnchain } from "@/lib/solana/missionCpi";
 import { NextResponse } from "next/server";
 import { getRedis } from "@/lib/server/redis";
 import { requireAdmin } from "@/lib/server/requireAdmin";
@@ -156,7 +157,6 @@ async function redisHIncrByCompat(redis: any, key: string, field: string, delta:
     const v = await redis.hIncrBy(key, field, delta);
     return asInt(v, 0);
   }
-  // fallback：读-改-写（慢，但仅在极少数不支持 hash 的环境）
   const cur = await redisHGetInt(redis, key, field);
   const next = cur + delta;
   await redisHSetPatch(redis, key, { [field]: next });
@@ -206,11 +206,8 @@ async function kvFindAndRemovePendingBySubmissionId(redis: any, submissionId: st
     return { foundRaw: null as any, foundObj: null as any, raw };
   };
 
-  // 先快扫（通常秒回）
   let r = await scan(399);
-  // 没命中才慢扫兜底
   if (!r.foundObj) r = await scan(1999);
-
   if (!r.foundObj) return { found: null as any };
 
   if (typeof redis.lRem === "function") await redis.lRem(kPending, 1, r.foundRaw);
@@ -322,8 +319,8 @@ async function memFindAndRemovePendingByFields(wallet: string, missionId: string
 }
 
 function missionBasePoints(missionId: string) {
-  const m = mockMissions.find((x) => x.id === missionId);
-  return Math.max(0, asInt(m?.basePoints, 0));
+  const mm = mockMissions.find((x) => x.id === missionId);
+  return Math.max(0, asInt(mm?.basePoints, 0));
 }
 
 export async function POST(req: Request) {
@@ -341,8 +338,10 @@ export async function POST(req: Request) {
     let pointsFromSubmission = -1;
     let submission: any = null;
 
-    // ✅ 只创建一次 redis（减少连接/初始化成本）
     const redis: any = driver === "kv" ? await kvClient() : null;
+
+    // ✅ onchain 结果作用域（KV/memory 都能用）
+    let onchain: any = null;
 
     // 1) submissionId 优先
     if (body.submissionId) {
@@ -415,7 +414,6 @@ export async function POST(req: Request) {
     const kOldPoints = `u:${wallet}:points`;
     const kOldCompleted = `u:${wallet}:completed`;
 
-    // ✅ already check（复用同一个 redis）
     const already = driver === "kv" ? await redis.get(claimKey) : await memGet(claimKey);
     if (already) {
       return noStoreJson({
@@ -427,19 +425,19 @@ export async function POST(req: Request) {
         periodKey: pKey,
         pointsAdded: 0,
         driver,
+        onchain: null,
       });
     }
 
     const now = Date.now();
 
+    // -------------------- KV driver --------------------
     if (driver === "kv") {
-      // claim flag
       await redis.set(claimKey, "1");
       if (m.period === "daily") await redis.expire(claimKey, 86400 * 8);
       if (m.period === "weekly") await redis.expire(claimKey, 86400 * 60);
       if (m.period === "once") await redis.set(kOldDone, "1");
 
-      // streak 只读 2 个字段（保持你现有结构）
       const curStreak = await redisHGetInt(redis, kProfile, "streak_count");
       const curLast = (await redis.hGet?.(kProfile, "streak_last_date")) ?? "";
       const nextStreak =
@@ -447,11 +445,9 @@ export async function POST(req: Request) {
           ? streakNextUTC(String(curLast || ""), String(pKey || todayKeyUTC()), curStreak)
           : { count: curStreak, lastDate: String(curLast || "") };
 
-      // ✅ 用 HINCRBY 直接拿到 nextTotal/nextClaims（去掉多次 GET）
       const nextTotal = await redisHIncrByCompat(redis, kProfile, "points_total", add);
       const nextClaims = await redisHIncrByCompat(redis, kProfile, "completed_total", 1);
 
-      // ✅ unique once（仍保持 once 规则）
       let didCountUnique = false;
       let nextUniqueOnce = await redisHGetInt(redis, kProfile, "unique_once_total");
 
@@ -464,14 +460,12 @@ export async function POST(req: Request) {
         }
       }
 
-      // 写 streak + updatedAt
       await redisHSetPatch(redis, kProfile, {
         streak_count: nextStreak.count,
         streak_last_date: nextStreak.lastDate,
         updatedAt: now,
       });
 
-      // period points：用 INCRBY 返回值，避免再 GET
       let dayPoints = 0;
       let weekPoints = 0;
 
@@ -480,11 +474,9 @@ export async function POST(req: Request) {
         else if (m.period === "weekly") weekPoints = asInt(await redis.incrBy(kPWeek, add), 0);
       }
 
-      // legacy
       if (add > 0) await redis.incrBy(kOldPoints, add);
       await redis.incr(kOldCompleted);
 
-      // ✅ leaderboard：只做增量覆盖（不全量重算）
       await redis.zAdd("leaderboard:points:all", [{ score: nextTotal, value: wallet }]);
       await redis.zAdd("leaderboard:completed:all", [{ score: nextClaims, value: wallet }]);
 
@@ -499,11 +491,45 @@ export async function POST(req: Request) {
         await redis.zAdd(wk, [{ score: sc, value: wallet }]);
       }
 
-      // legacy zset（fallback）
       await redis.zAdd("leaderboard:points", [{ score: nextTotal, value: wallet }]);
       await redis.zAdd("leaderboard:completed", [{ score: nextClaims, value: wallet }]);
 
-      // ledger
+      // ✅ 上链（失败不影响 approve）
+      if (add > 0) {
+        try {
+          // ✅ Phase B：meta（Proof of Mission）预留
+          onchain = await awardPointsOnchain({
+            owner: wallet,
+            amount: add,
+            meta: {
+              missionId: m.id,
+              periodKey: pKey,
+              admin: auth.wallet,
+              ts: now,
+            },
+          } as any);
+        } catch (e: any) {
+          onchain = { ok: false, error: e?.message ?? "onchain_error" };
+        }
+
+        // ✅ Phase A：写 last onchain receipt（用于 /api/points/summary 展示最近一次上链时间/tx）
+        if (onchain?.ok && onchain?.tx) {
+          try {
+            await redis.set(
+              `onchain:last:${wallet}`,
+              JSON.stringify({
+                ts: now,
+                tx: onchain.tx,
+                amount: add,
+                missionId: m.id,
+                periodKey: pKey,
+                admin: auth.wallet,
+              })
+            );
+          } catch {}
+        }
+      }
+
       const entry = {
         ts: now,
         wallet,
@@ -517,6 +543,12 @@ export async function POST(req: Request) {
         proof: submission?.proof,
         submissionId: submission?.submissionId || body.submissionId,
         uniqueCounted: didCountUnique ? 1 : 0,
+
+        onchainOk: !!onchain?.ok,
+        onchainTx: onchain?.tx || null,
+        onchainError: onchain?.ok ? null : (onchain?.error || null),
+        onchainDidInitMissionSigner: !!onchain?.didInitMissionSigner,
+        onchainDidInitPoints: !!onchain?.didInitPoints,
       };
 
       if (typeof redis.lPush === "function") {
@@ -546,6 +578,7 @@ export async function POST(req: Request) {
         uniqueCompleted: nextUniqueOnce,
         uniqueCountedThisTime: didCountUnique,
         driver,
+        onchain: onchain ?? null,
       });
     }
 
@@ -563,6 +596,7 @@ export async function POST(req: Request) {
 
     let didCountUnique = false;
     let nextUniqueOnce = curUniqueOnce;
+
     if (m.period === "once") {
       const existed = await memGet(uniqueKey);
       if (!existed) {
@@ -586,6 +620,24 @@ export async function POST(req: Request) {
     if (add > 0) await memIncrBy(kOldPoints, add);
     await memIncr(kOldCompleted);
 
+    // ✅ memory 模式也可上链（保持一致）
+    if (add > 0) {
+      try {
+        onchain = await awardPointsOnchain({
+          owner: wallet,
+          amount: add,
+          meta: {
+            missionId: m.id,
+            periodKey: pKey,
+            admin: auth.wallet,
+            ts: now,
+          },
+        } as any);
+      } catch (e: any) {
+        onchain = { ok: false, error: e?.message ?? "onchain_error" };
+      }
+    }
+
     await memLPush(
       kLedger,
       {
@@ -600,6 +652,12 @@ export async function POST(req: Request) {
         note: String(body.note || "approved_by_admin"),
         submissionId: submission?.submissionId || body.submissionId,
         uniqueCounted: didCountUnique ? 1 : 0,
+
+        onchainOk: !!onchain?.ok,
+        onchainTx: onchain?.tx || null,
+        onchainError: onchain?.ok ? null : (onchain?.error || null),
+        onchainDidInitMissionSigner: !!onchain?.didInitMissionSigner,
+        onchainDidInitPoints: !!onchain?.didInitPoints,
       },
       999
     );
@@ -617,6 +675,7 @@ export async function POST(req: Request) {
       uniqueCompleted: nextUniqueOnce,
       uniqueCountedThisTime: didCountUnique,
       driver,
+      onchain: onchain ?? null,
     });
   } catch (e: any) {
     return noStoreJson({ ok: false, error: e?.message ?? "approve_error" }, 500);
