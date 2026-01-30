@@ -75,6 +75,19 @@ function noStoreJson(data: any, status = 200) {
   return res;
 }
 
+// ✅ onchain 开关（兼容多变量名）
+function isOnchainEnabled() {
+  const v =
+    process.env.MISSION_ONCHAIN_ENABLED ??
+    process.env.ONCHAIN_ENABLED ??
+    process.env.ENABLE_ONCHAIN ??
+    process.env.NEXT_PUBLIC_MISSION_ONCHAIN_ENABLED;
+
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
 // -------------------- memory store (dev) --------------------
 type MemDB = { kv: Map<string, any> };
 function getMemDB(): MemDB {
@@ -496,37 +509,41 @@ export async function POST(req: Request) {
 
       // ✅ 上链（失败不影响 approve）
       if (add > 0) {
-        try {
-          // ✅ Phase B：meta（Proof of Mission）预留
-          onchain = await awardPointsOnchain({
-            owner: wallet,
-            amount: add,
-            meta: {
-              missionId: m.id,
-              periodKey: pKey,
-              admin: auth.wallet,
-              ts: now,
-            },
-          } as any);
-        } catch (e: any) {
-          onchain = { ok: false, error: e?.message ?? "onchain_error" };
-        }
-
-        // ✅ Phase A：写 last onchain receipt（用于 /api/points/summary 展示最近一次上链时间/tx）
-        if (onchain?.ok && onchain?.tx) {
+        if (!isOnchainEnabled()) {
+          onchain = { ok: false, skipped: true, error: "onchain_disabled" };
+        } else {
           try {
-            await redis.set(
-              `onchain:last:${wallet}`,
-              JSON.stringify({
-                ts: now,
-                tx: onchain.tx,
-                amount: add,
+            // ✅ Phase B：meta（Proof of Mission）预留
+            onchain = await awardPointsOnchain({
+              owner: wallet,
+              amount: add,
+              meta: {
                 missionId: m.id,
                 periodKey: pKey,
                 admin: auth.wallet,
-              })
-            );
-          } catch {}
+                ts: now,
+              },
+            } as any);
+          } catch (e: any) {
+            onchain = { ok: false, error: e?.message ?? "onchain_error" };
+          }
+
+          // ✅ Phase A：写 last onchain receipt（用于 /api/points/summary 展示最近一次上链时间/tx）
+          if (onchain?.ok && onchain?.tx) {
+            try {
+              await redis.set(
+                `onchain:last:${wallet}`,
+                JSON.stringify({
+                  ts: now,
+                  tx: onchain.tx,
+                  amount: add,
+                  missionId: m.id,
+                  periodKey: pKey,
+                  admin: auth.wallet,
+                })
+              );
+            } catch {}
+          }
         }
       }
 
@@ -622,19 +639,23 @@ export async function POST(req: Request) {
 
     // ✅ memory 模式也可上链（保持一致）
     if (add > 0) {
-      try {
-        onchain = await awardPointsOnchain({
-          owner: wallet,
-          amount: add,
-          meta: {
-            missionId: m.id,
-            periodKey: pKey,
-            admin: auth.wallet,
-            ts: now,
-          },
-        } as any);
-      } catch (e: any) {
-        onchain = { ok: false, error: e?.message ?? "onchain_error" };
+      if (!isOnchainEnabled()) {
+        onchain = { ok: false, skipped: true, error: "onchain_disabled" };
+      } else {
+        try {
+          onchain = await awardPointsOnchain({
+            owner: wallet,
+            amount: add,
+            meta: {
+              missionId: m.id,
+              periodKey: pKey,
+              admin: auth.wallet,
+              ts: now,
+            },
+          } as any);
+        } catch (e: any) {
+          onchain = { ok: false, error: e?.message ?? "onchain_error" };
+        }
       }
     }
 

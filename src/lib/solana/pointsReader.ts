@@ -1,16 +1,11 @@
 // src/lib/solana/pointsReader.ts
-import * as anchor from "@coral-xyz/anchor";
+import { BorshAccountsCoder } from "@coral-xyz/anchor";
 import { PublicKey } from "@solana/web3.js";
-import fs from "fs";
-import path from "path";
-import { getProvider } from "./anchor";
+import { getConnection } from "./programs";
+import { WAOC_POINTS_PROGRAM_ID, SEED_POINTS } from "./config";
 
-const SEED_POINTS = Buffer.from("points");
-const IDL_POINTS_PATH = path.join(process.cwd(), "idl", "waoc_points.json");
-
-function loadPointsIdl(): any {
-  return JSON.parse(fs.readFileSync(IDL_POINTS_PATH, "utf8"));
-}
+// ✅ 直接静态引入 IDL（无 fs/path/process.cwd）
+import waocPointsIdl from "../../../idl/waoc_points.json";
 
 function bnToString(v: any): string {
   if (v == null) return "0";
@@ -21,35 +16,94 @@ function bnToString(v: any): string {
   return "0";
 }
 
+function toBase58Maybe(x: any): string {
+  try {
+    if (x && typeof x.toBase58 === "function") return x.toBase58();
+  } catch {}
+  return String(x ?? "");
+}
+
+/**
+ * Read WAOC Points PDA and (if possible) decode it via IDL.
+ * - Never assumes Program.at
+ * - Works in API routes (nodejs runtime)
+ */
 export async function fetchPointsAccount(owner: string) {
-  const provider = getProvider();
+  const connection = getConnection();
 
-  const ownerPk = new PublicKey(owner);
-  const pointsProgramId = new PublicKey(process.env.WAOC_POINTS_PROGRAM_ID!);
+  const ownerStr = String(owner || "").trim();
+  if (!ownerStr) throw new Error("missing owner");
 
+  const programIdStr = String(WAOC_POINTS_PROGRAM_ID || "").trim();
+  if (!programIdStr) throw new Error("missing WAOC_POINTS_PROGRAM_ID");
+
+  const ownerPk = new PublicKey(ownerStr);
+  const programIdPk = new PublicKey(programIdStr);
+
+  // ✅ seeds must be Buffer
+  const seedBuf = Buffer.from(String(SEED_POINTS || "points"));
+
+  // ✅ PDA must use programId PublicKey
   const [pda] = PublicKey.findProgramAddressSync(
-    [SEED_POINTS, ownerPk.toBuffer()],
-    pointsProgramId
+    [seedBuf, ownerPk.toBuffer()],
+    programIdPk
   );
 
-  const info = await provider.connection.getAccountInfo(pda, "confirmed");
+  const info = await connection.getAccountInfo(pda, "confirmed");
   if (!info) {
     return { exists: false as const, pda: pda.toBase58() };
   }
 
-  // ✅ 不用 Program，直接用 coder 解码（规避 idl.accounts[].size）
-  const idl = loadPointsIdl();
-  const coder = new anchor.BorshAccountsCoder(idl);
+  // ✅ 用 coder 解码（不依赖 Program / 不触发 Wallet 导出问题）
+  const coder = new BorshAccountsCoder(waocPointsIdl as any);
 
-  // 账户名必须和 IDL 的 accounts.name 对上（你的是 PointsAccount）
-  const acct: any = coder.decode("PointsAccount", info.data);
+  // 账户名：尽量自动探测，避免你 IDL 里不是 PointsAccount 导致直接 throw
+  const accountNameCandidates = [
+    "PointsAccount",
+    "pointsAccount",
+    "points_account",
+    "Points",
+    "points",
+  ];
 
+  let acct: any = null;
+  let usedName: string | null = null;
+  let decodeError: string | null = null;
+
+  for (const name of accountNameCandidates) {
+    try {
+      acct = coder.decode(name, info.data);
+      usedName = name;
+      decodeError = null;
+      break;
+    } catch (e: any) {
+      decodeError = e?.message ? String(e.message) : String(e);
+    }
+  }
+
+  // ✅ decode 失败也不要 500：返回 exists:true + 基础信息
+  if (!acct) {
+    return {
+      exists: true as const,
+      pda: pda.toBase58(),
+      owner: ownerPk.toBase58(),
+      total: "0",
+      raw: {
+        decode_error: decodeError,
+        idl_account_tried: accountNameCandidates,
+        owner: ownerPk.toBase58(),
+      },
+    };
+  }
+
+  // 尽量兼容各种字段命名
   const ownerAny = acct?.owner ?? acct?.authority ?? acct?.user ?? ownerPk;
   const totalAny =
     acct?.totalPoints ??
     acct?.total_points ??
     acct?.total ??
     acct?.pointsTotal ??
+    acct?.points ??
     0;
 
   const bumpAny = acct?.bump ?? acct?._bump ?? null;
@@ -59,14 +113,15 @@ export async function fetchPointsAccount(owner: string) {
   return {
     exists: true as const,
     pda: pda.toBase58(),
-    owner: typeof ownerAny?.toBase58 === "function" ? ownerAny.toBase58() : String(ownerAny),
+    owner: toBase58Maybe(ownerAny) || ownerPk.toBase58(),
     total: bnToString(totalAny),
     raw: {
-      owner: typeof ownerAny?.toBase58 === "function" ? ownerAny.toBase58() : String(ownerAny),
+      idl_account_name: usedName,
+      owner: toBase58Maybe(ownerAny) || ownerPk.toBase58(),
       total_points: bnToString(totalAny),
       bump: bumpAny ?? null,
-      created_at: createdAny ? bnToString(createdAny) : null,
-      updated_at: updatedAny ? bnToString(updatedAny) : null,
+      created_at: createdAny != null ? bnToString(createdAny) : null,
+      updated_at: updatedAny != null ? bnToString(updatedAny) : null,
     },
   };
 }

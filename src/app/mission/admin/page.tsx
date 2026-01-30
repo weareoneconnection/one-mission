@@ -1,8 +1,9 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useWallet } from "@solana/wallet-adapter-react";
+import bs58 from "bs58";
 
 type PendingItem = {
   ts?: number;
@@ -43,40 +44,43 @@ function shortWallet(w?: string) {
   return `${w.slice(0, 4)}...${w.slice(-4)}`;
 }
 
-function copyToClipboard(s: string) {
+async function copyToClipboard(s: string) {
   try {
-    navigator.clipboard?.writeText(s);
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(s);
+      return;
+    }
+  } catch {}
+  try {
+    const el = document.createElement("textarea");
+    el.value = s;
+    el.style.position = "fixed";
+    el.style.left = "-9999px";
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand("copy");
+    document.body.removeChild(el);
   } catch {}
 }
 
-// ✅ 关键：完全按后端 verifyAdminSignature 的规则来
-// 后端要求：
-// - headers: x-admin-wallet / x-admin-timestamp / x-admin-msg / x-admin-signature
-// - msg 必须 === "POST:/api/mission/approve"
-// - payload = `${msg}|${ts}`
-// - signature 是对 payload 的 bytes 做签名，然后 bs58 encode
-async function adminHeaders(
-  walletAddress: string,
-  signMessage: any,
-  action: string = "POST:/api/mission/approve" // ✅ 默认不破坏你其他调用
-) {
-  const ts = String(Date.now());
-  const msg = action; // ✅ 改成可传入
+function normalizeWalletSignError(e: any) {
+  const raw = String(e?.message || e || "");
+  const m = raw.toLowerCase();
 
-  const payload = `${msg}|${ts}`;
-  const data = new TextEncoder().encode(payload);
-  const sigBytes = await signMessage(data);
-  const { default: bs58 } = await import("bs58");
-  const sig = bs58.encode(sigBytes);
-
-  return {
-    "x-admin-wallet": walletAddress,
-    "x-admin-timestamp": ts,
-    "x-admin-msg": msg,
-    "x-admin-signature": sig,
-  };
+  if (m.includes("walletsignmessageerror") && m.includes("invalid account")) {
+    return "Wallet signature failed: invalid account. Please disconnect the wallet, refresh the page, then reconnect (do not switch account), and try again.";
+  }
+  if (m.includes("user rejected") || m.includes("rejected")) {
+    return "Signature request was rejected in wallet.";
+  }
+  if (m.includes("not connected") || m.includes("wallet not connected")) {
+    return "Wallet not connected. Please connect your admin wallet first.";
+  }
+  if (m.includes("signmessage") && m.includes("not supported")) {
+    return "This wallet does not support signMessage. Use Phantom / Backpack / Solflare (with message signing enabled).";
+  }
+  return raw || "Admin request failed";
 }
-
 
 function isHttpUrl(s: string) {
   return /^https?:\/\//i.test(s);
@@ -87,7 +91,6 @@ function safeUrl(v: any): string {
   if (typeof v === "function") return "";
   const s = String(v).trim();
   if (!s) return "";
-  // 避免出现 "function link(){[native code]}" 这种
   if (s.startsWith("function ")) return "";
   if (s === "[object Object]") return "";
   return s;
@@ -105,15 +108,15 @@ function extractProof(it: PendingItem) {
 
   const url = isHttpUrl(urlCandidate) ? urlCandidate : "";
 
-  const text = String(p.text || p.note || p.desc || it.note || "").trim();
-  const tx = String(p.tx || p.signature || p.hash || "").trim();
+  const text = String((p as any).text || (p as any).note || (p as any).desc || it.note || "").trim();
+  const tx = String((p as any).tx || (p as any).signature || (p as any).hash || "").trim();
 
   const filesRaw: any[] = Array.isArray(it.files)
     ? it.files
-    : Array.isArray(p.files)
-    ? p.files
-    : Array.isArray(p.images)
-    ? p.images
+    : Array.isArray((p as any).files)
+    ? (p as any).files
+    : Array.isArray((p as any).images)
+    ? (p as any).images
     : [];
 
   const images = filesRaw
@@ -128,8 +131,34 @@ function extractProof(it: PendingItem) {
   return { url, text, tx, images, raw: it.proof };
 }
 
+// ✅ 只用于“登录/登出/检查 session”的签名头（不再给 pending/approve/reject 用）
+async function adminHeadersForSession(
+  walletAddress: string,
+  signMessage: any,
+  method: "GET" | "POST" | "DELETE",
+  path: "/api/mission/admin/session"
+) {
+  const ts = String(Date.now());
+  if (!walletAddress) throw new Error("Wallet not connected.");
+  if (!signMessage) throw new Error("Wallet does not support signMessage.");
+
+  // ✅ 关键：msg 第一段必须是 METHOD:/api/xxx（不能带 query）
+  const msg = `${method}:${path}`;
+  const payload = `${msg}|${ts}`;
+  const data = new TextEncoder().encode(payload);
+  const sigBytes = await signMessage(data);
+  const sig = bs58.encode(sigBytes);
+
+  return {
+    "x-admin-wallet": walletAddress,
+    "x-admin-timestamp": ts,
+    "x-admin-msg": msg,
+    "x-admin-signature": sig,
+  };
+}
+
 export default function AdminPage() {
-  const { publicKey, connected, signMessage } = useWallet();
+  const { publicKey, connected, signMessage, wallet } = useWallet();
   const walletAddress = useMemo(() => (publicKey ? publicKey.toBase58() : ""), [publicKey]);
   const canSign = Boolean(signMessage);
 
@@ -137,9 +166,9 @@ export default function AdminPage() {
   const [items, setItems] = useState<PendingItem[]>([]);
   const [err, setErr] = useState<string>("");
 
-  // ✅ 默认 50（不要 1000）
   const [limit, setLimit] = useState(50);
 
+  // ✅ 这里 adminSession 代表“服务端 session 是否有效”（cookie）
   const [adminSession, setAdminSession] = useState<{ ok: boolean; wallet?: string }>({ ok: false });
   const adminWallet = adminSession.ok ? adminSession.wallet || "" : "";
 
@@ -149,14 +178,24 @@ export default function AdminPage() {
     open: false,
   });
 
+  // ✅ 只用于 list/pending 拉取的取消（不要拿它去 abort approve/reject）
+  const pendingAbortRef = useRef<AbortController | null>(null);
+  const pendingActionLock = useRef<Set<string>>(new Set());
+
+  async function fetchJson(input: RequestInfo | URL, init?: RequestInit) {
+    const r = await fetch(input, init);
+    const j = await r.json().catch(() => ({}));
+    return { r, j };
+  }
+
+  // ✅ 永远以服务端 session 为准（避免“UI显示已登录但请求401”）
   const checkAdminSession = async () => {
     try {
-      const r = await fetch("/api/mission/admin/session", {
+      const { r, j } = await fetchJson("/api/mission/admin/session", {
         method: "GET",
         cache: "no-store",
         credentials: "include",
       });
-      const j = await r.json().catch(() => ({}));
       if (r.ok && j?.ok) setAdminSession({ ok: true, wallet: j.wallet });
       else setAdminSession({ ok: false });
     } catch {
@@ -169,24 +208,32 @@ export default function AdminPage() {
     if (!connected || !walletAddress) return setErr("Connect admin wallet first.");
     if (!canSign) return setErr("Wallet must support signMessage (e.g., Phantom).");
 
+    if (!publicKey) return setErr("Wallet not connected.");
+    if (walletAddress !== publicKey.toBase58()) {
+      return setErr("Wallet state mismatch. Please disconnect and reconnect your wallet.");
+    }
+
     setLoading(true);
     try {
-      const headers = await adminHeaders(walletAddress, signMessage, "POST:/api/mission/admin/session");
+      // ✅ 只签一次：POST /api/mission/admin/session
+      const headers = await adminHeadersForSession(walletAddress, signMessage, "POST", "/api/mission/admin/session");
 
-      const r = await fetch("/api/mission/admin/session", {
+      const { r, j } = await fetchJson("/api/mission/admin/session", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...headers },
         cache: "no-store",
-        credentials: "include",
+        credentials: "include", // ✅ 关键：让后端 set-cookie 生效
         body: JSON.stringify({}),
       });
 
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok || !j?.ok) return setErr(j?.error || `Admin login failed (${r.status})`);
+      if (!r.ok || !j?.ok) {
+        return setErr(j?.error || `Admin login failed (${r.status})`);
+      }
 
-      setAdminSession({ ok: true, wallet: j.wallet });
+      // ✅ 立刻同步 session
+      await checkAdminSession();
     } catch (e: any) {
-      setErr(e?.message || "Admin login failed");
+      setErr(normalizeWalletSignError(e));
     } finally {
       setLoading(false);
     }
@@ -196,13 +243,28 @@ export default function AdminPage() {
     setErr("");
     setLoading(true);
     try {
-      await fetch("/api/mission/admin/session", {
-        method: "DELETE",
-        cache: "no-store",
-        credentials: "include",
-      }).catch(() => {});
+      // ✅ 可选：DELETE session（这里也签一下，保持一致）
+      if (connected && walletAddress && canSign) {
+        try {
+          const headers = await adminHeadersForSession(
+            walletAddress,
+            signMessage,
+            "DELETE",
+            "/api/mission/admin/session"
+          );
+          await fetch("/api/mission/admin/session", {
+            method: "DELETE",
+            headers,
+            cache: "no-store",
+            credentials: "include",
+          }).catch(() => {});
+        } catch {
+          // ignore
+        }
+      }
     } finally {
       setAdminSession({ ok: false });
+      setItems([]);
       setLoading(false);
     }
   };
@@ -212,112 +274,127 @@ export default function AdminPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ✅ 只改这里：永远用 slim=1（后端会去掉 dataUrl/base64）
+  // ✅ Load Pending：不签名，不弹窗，只带 cookie
   const loadPending = async () => {
     setErr("");
     if (!adminSession.ok) return setErr("Admin session required. Click Admin Login first.");
 
+    pendingAbortRef.current?.abort();
+    const ac = new AbortController();
+    pendingAbortRef.current = ac;
+
     setLoading(true);
     try {
       const lim = clamp(limit, 1, 1000);
-      const r = await fetch(`/api/mission/pending?limit=${lim}&slim=1`, {
+      const url = `/api/mission/pending?limit=${lim}&slim=1`;
+
+      const r = await fetch(url, {
         method: "GET",
         cache: "no-store",
         credentials: "include",
+        signal: ac.signal,
       });
+
       const j = await r.json().catch(() => ({}));
-      if (!r.ok || !j?.ok) return setErr(j?.error || `Request failed (${r.status})`);
+      if (!r.ok || !j?.ok) {
+        // ✅ session 失效则同步 UI
+        if (r.status === 401) await checkAdminSession();
+        return setErr(j?.error || `Request failed (${r.status})`);
+      }
+
       setItems(Array.isArray(j.items) ? j.items : []);
     } catch (e: any) {
+      if (String(e?.name || "").toLowerCase().includes("abort")) return;
       setErr(e?.message || "Load failed");
     } finally {
       setLoading(false);
     }
   };
 
-  // ✅ 本地移除 + 失败回滚（避免 approve/reject 后全量 reload）
   const removeLocal = (sid: string) => {
     setItems((prev) => prev.filter((x) => x.submissionId !== sid));
   };
 
+  // ✅ Approve：不签名，不弹窗，只带 cookie
   const approveOne = async (it: PendingItem) => {
     setErr("");
     if (!adminSession.ok) return setErr("Admin session required. Click Admin Login first.");
-    if (!it.submissionId) {
-      return setErr("Missing submissionId. Backend must generate submissionId for each pending item.");
-    }
+    if (!it.submissionId) return setErr("Missing submissionId. Backend must generate submissionId.");
 
     const sid = it.submissionId;
-    const snapshot = items; // 回滚用
 
-    // ✅ 先秒删（用户体感立即快）
+    if (pendingActionLock.current.has(sid)) return;
+    pendingActionLock.current.add(sid);
+
+    const snapshot = items;
     removeLocal(sid);
 
     setLoading(true);
     try {
+      const body = { submissionId: sid, note: "approved_by_admin" };
+
       const r = await fetch(`/api/mission/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
         credentials: "include",
-        body: JSON.stringify({
-          submissionId: sid,
-          note: "approved_by_admin",
-        }),
+        body: JSON.stringify(body),
       });
 
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j?.ok) {
-        // 回滚
         setItems(snapshot);
+        if (r.status === 401) await checkAdminSession();
         return setErr(j?.error || `Approve failed (${r.status})`);
       }
     } catch (e: any) {
       setItems(snapshot);
       setErr(e?.message || "Approve failed");
     } finally {
+      pendingActionLock.current.delete(sid);
       setLoading(false);
     }
   };
 
+  // ✅ Reject：不签名，不弹窗，只带 cookie
   const rejectOne = async (it: PendingItem) => {
     setErr("");
     if (!adminSession.ok) return setErr("Admin session required. Click Admin Login first.");
-    if (!it.submissionId) {
-      return setErr("Missing submissionId. Backend must generate submissionId for each pending item.");
-    }
+    if (!it.submissionId) return setErr("Missing submissionId. Backend must generate submissionId.");
 
     const sid = it.submissionId;
-    const snapshot = items;
 
+    if (pendingActionLock.current.has(sid)) return;
+    pendingActionLock.current.add(sid);
+
+    const snapshot = items;
     const reason = (rejectReason[sid] || "").trim() || "not_enough_proof";
 
-    // ✅ 先秒删
     removeLocal(sid);
 
     setLoading(true);
     try {
+      const body = { submissionId: sid, reason, note: "" };
+
       const r = await fetch(`/api/mission/reject`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
         credentials: "include",
-        body: JSON.stringify({
-          submissionId: sid,
-          reason,
-          note: "",
-        }),
+        body: JSON.stringify(body),
       });
 
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j?.ok) {
         setItems(snapshot);
+        if (r.status === 401) await checkAdminSession();
         return setErr(j?.error || `Reject failed (${r.status})`);
       }
     } catch (e: any) {
       setItems(snapshot);
       setErr(e?.message || "Reject failed");
     } finally {
+      pendingActionLock.current.delete(sid);
       setLoading(false);
     }
   };
@@ -358,8 +435,7 @@ export default function AdminPage() {
             <div className="text-xs text-zinc-600">ONE MISSION</div>
             <h1 className="mt-1 text-2xl font-semibold text-zinc-900">Admin Review</h1>
             <p className="mt-1 text-sm text-zinc-700">
-              Review pending submissions. ✅ Requires <b>submissionId</b> from backend for correct
-              approve/reject removal.
+              Review pending submissions. ✅ Requires <b>submissionId</b> from backend for correct approve/reject removal.
             </p>
           </div>
 
@@ -398,7 +474,15 @@ export default function AdminPage() {
             onClick={adminLogin}
             disabled={loading || !connected || !walletAddress || !canSign}
             className="rounded-xl border border-zinc-900/15 bg-white/60 px-3 py-2 text-sm font-semibold text-zinc-900 hover:bg-white disabled:opacity-60"
-            title={!connected ? "Connect wallet first" : !canSign ? "Wallet must support signMessage" : ""}
+            title={
+              !connected
+                ? "Connect wallet first"
+                : !canSign
+                ? "Wallet must support signMessage"
+                : wallet?.adapter?.name
+                ? `Wallet: ${wallet.adapter.name}`
+                : ""
+            }
           >
             {adminSession.ok ? "Re-login" : "Admin Login"}
           </button>
@@ -410,6 +494,16 @@ export default function AdminPage() {
             className="rounded-xl border border-zinc-900/15 bg-white/60 px-3 py-2 text-sm font-semibold text-zinc-700 hover:bg-white disabled:opacity-60"
           >
             Logout
+          </button>
+
+          <button
+            type="button"
+            onClick={checkAdminSession}
+            disabled={loading}
+            className="rounded-xl border border-zinc-900/15 bg-white/60 px-3 py-2 text-sm font-semibold text-zinc-700 hover:bg-white disabled:opacity-60"
+            title="Re-check session from server"
+          >
+            Refresh Session
           </button>
 
           <div className="ml-auto flex items-center gap-2">
@@ -428,6 +522,9 @@ export default function AdminPage() {
         {!adminSession.ok ? (
           <div className="mt-4 rounded-2xl border border-amber-500/20 bg-amber-50/60 p-3 text-sm text-amber-900">
             Admin is separate: connect your <b>admin wallet</b> and click <b>Admin Login</b>.
+            <div className="mt-2 text-xs text-amber-900/80">
+              If you see <b>invalid account</b>, disconnect wallet → refresh → reconnect (do not switch account).
+            </div>
           </div>
         ) : null}
 
@@ -485,8 +582,7 @@ export default function AdminPage() {
                         </div>
                       ) : (
                         <div className="mt-2 rounded-2xl border border-amber-500/20 bg-amber-50/60 p-3 text-sm text-amber-900">
-                          ⚠️ Missing <b>submissionId</b>. Backend must generate it in pending queue,
-                          otherwise approve/reject cannot remove items.
+                          ⚠️ Missing <b>submissionId</b>. Backend must generate it in pending queue, otherwise approve/reject cannot remove items.
                         </div>
                       )}
 

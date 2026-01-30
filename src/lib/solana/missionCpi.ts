@@ -1,186 +1,130 @@
 // src/lib/solana/missionCpi.ts
-import * as anchor from "@coral-xyz/anchor/dist/cjs";
-import { PublicKey, TransactionInstruction } from "@solana/web3.js";
-import { getProvider, getWaocMissionProgram, getWaocPointsProgram } from "./anchor";
+import "server-only";
 
-const SEED_MISSION_SIGNER = Buffer.from("mission_signer");
-const SEED_POINTS_CONFIG = Buffer.from("points_config");
+import fs from "fs";
+import path from "path";
+import { PublicKey, Connection, Keypair } from "@solana/web3.js";
+
+// ===== seeds (must match Rust) =====
+const SEED_CONFIG = Buffer.from("points_config");
 const SEED_POINTS = Buffer.from("points");
 
-// Solana Memo Program (fixed id)
-const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
-
-// --- helpers ---
-function toCamel(s: string) {
-  // award_points -> awardPoints
-  return s.replace(/_([a-z0-9])/g, (_, c) => String(c).toUpperCase());
+function mustEnv(name: string) {
+  const v = String(process.env[name] || "").trim();
+  if (!v) throw new Error(`missing_env:${name}`);
+  return v;
 }
 
-function pickMethod(program: any, idlName: string) {
-  const camel = toCamel(idlName);
-  const m1 = program?.methods?.[camel];
-  if (typeof m1 === "function") return { fnName: camel, fn: m1 };
-
-  const m2 = program?.methods?.[idlName];
-  if (typeof m2 === "function") return { fnName: idlName, fn: m2 };
-
-  // 兜底：把可用指令列出来，避免 encode 这种“黑盒报错”
-  const names = (program?.idl?.instructions || [])
-    .map((i: any) => i?.name)
-    .filter(Boolean);
-  throw new Error(
-    `anchor_method_not_found: want=${idlName} (try ${camel}/${idlName}) idl_instructions=${JSON.stringify(names)}`
-  );
+function mustPkEnv(name: string) {
+  return new PublicKey(mustEnv(name));
 }
 
-function safeMemoString(v: any, maxBytes = 450) {
-  // 尽量短：用紧凑 JSON
-  let s = "";
-  try {
-    s = JSON.stringify(v);
-  } catch {
-    s = String(v ?? "");
-  }
+function readKeypairFromEnvPath(envName: string) {
+  const p = mustEnv(envName);
+  const abs = p.startsWith("~")
+    ? path.join(process.env.HOME || "", p.slice(1))
+    : p;
 
-  const enc = new TextEncoder();
-  const bytes = enc.encode(s);
-  if (bytes.length <= maxBytes) return s;
-
-  // 超长就截断（保持可解析性：加一个 ...）
-  // 这里用“按字符”截断做近似，避免复杂的按字节截断
-  const cut = Math.max(0, Math.floor((s.length * maxBytes) / bytes.length) - 3);
-  return s.slice(0, cut) + "...";
+  const raw = fs.readFileSync(abs, "utf8");
+  const arr = JSON.parse(raw);
+  if (!Array.isArray(arr)) throw new Error(`invalid_keypair_json:${envName}`);
+  return Keypair.fromSecretKey(Uint8Array.from(arr));
 }
 
-function buildMemoIx(memo: string) {
-  return new TransactionInstruction({
-    programId: MEMO_PROGRAM_ID,
-    keys: [],
-    data: Buffer.from(memo, "utf8"),
-  });
+async function getAnchor() {
+  // ✅ 用 dynamic import 绕开 turbopack 对 anchor named export 的静态检查
+  const anchor = await import("@coral-xyz/anchor");
+  return anchor;
 }
-
-export type AwardMeta = {
-  missionId?: string;
-  periodKey?: string;
-  admin?: string;
-  ts?: number;
-  // 你未来想带 submissionId / proofHash 也可以加：
-  submissionId?: string;
-};
 
 /**
- * ✅ 上链加分（失败不 throw，返回 ok:false）
- * - fast path: award_points
- * - 若 mission_signer 未 init -> init_mission_signer -> retry
+ * ✅ Admin-only onchain write (Phase-A / v1)
+ * - 只调用 waoc_points.add_points
+ * - authority = admin signer
+ * - owner 不需要签名（points 合约里 owner 是 UncheckedAccount）
  *
- * ✅ 可选 meta：会写入 Memo（Phase B: Proof of Mission 的最小可用版本）
- *
- * ⚠️ 注意：你现在 waoc_points 并没有 init_points 指令（你 IDL 只有 2 个 instruction 都在 waoc_mission）
- * 所以这里不做 initPoints。points account 是否自动创建，应由 mission program CPI 里处理。
+ * 前提：
+ * - 用户 points PDA 已经由用户自己 initialize_points 初始化过
+ *   （因为你的合约 InitializePoints 要求 owner: Signer）
  */
-export async function awardPointsOnchain(params: { owner: string; amount: number; meta?: AwardMeta }) {
-  const provider = getProvider();
-  const missionProgram: any = getWaocMissionProgram(provider);
-  const pointsProgram: any = getWaocPointsProgram(provider);
-
+export async function awardPointsOnchain(params: {
+  owner: string;
+  amount: number;
+  meta?: {
+    missionId?: string;
+    periodKey?: string;
+    submissionId?: string;
+    ts?: number;
+    admin?: string;
+  };
+}) {
   const ownerPk = new PublicKey(params.owner);
-  const amountBn = new anchor.BN(Math.max(0, Math.trunc(params.amount)));
+  const amount = Math.max(0, Math.trunc(params.amount || 0));
+  if (!amount) return { ok: false as const, error: "invalid_amount" };
 
-  const [missionSignerPda] = PublicKey.findProgramAddressSync(
-    [SEED_MISSION_SIGNER],
-    missionProgram.programId
-  );
+  const rpc = mustEnv("SOLANA_RPC_URL");
+  const POINTS_PID = mustPkEnv("WAOC_POINTS_PROGRAM_ID");
 
-  const [configPda] = PublicKey.findProgramAddressSync(
-    [SEED_POINTS_CONFIG],
-    pointsProgram.programId
-  );
+  const adminKp = readKeypairFromEnvPath("WAOC_ADMIN_SECRET_JSON");
 
-  const [pointsPda] = PublicKey.findProgramAddressSync(
-    [SEED_POINTS, ownerPk.toBuffer()],
-    pointsProgram.programId
-  );
+  const connection = new Connection(rpc, "confirmed");
 
-  const callAward = async () => {
-    // ✅ 用 IDL 名称，避免版本差异导致 encode undefined
-    const { fnName, fn } = pickMethod(missionProgram, "award_points");
+  const anchor = await getAnchor();
+  const { AnchorProvider, Program, BN } = anchor;
 
-    // ✅ Phase B：可选 memo（proof of mission 基础）
-    // 尽量短，避免交易过大
-    const memoObj =
-      params.meta && Object.keys(params.meta).length
-        ? {
-            p: "waoc", // prefix
-            v: 1,
-            owner: params.owner,
-            amt: Math.max(0, Math.trunc(params.amount)),
-            mid: params.meta.missionId || undefined,
-            pk: params.meta.periodKey || undefined,
-            admin: params.meta.admin || undefined,
-            ts: params.meta.ts || undefined,
-            sid: params.meta.submissionId || undefined,
-          }
-        : null;
-
-    const memoIx = memoObj ? buildMemoIx(safeMemoString(memoObj)) : null;
-
-    let builder = fn(amountBn).accounts({
-      waocPointsProgram: pointsProgram.programId,
-      pointsConfig: configPda,
-      points: pointsPda,
-      owner: ownerPk,
-      missionSigner: missionSignerPda,
-      admin: provider.wallet.publicKey,
-    });
-
-    if (memoIx) {
-      // Anchor method builder 支持 preInstructions
-      builder = builder.preInstructions([memoIx]);
-    }
-
-    const tx = await builder.rpc();
-
-    return { tx, fnName, memo: memoObj ? safeMemoString(memoObj) : null };
+  // ✅ 构造一个最小 wallet（只需要 signTransaction）
+  const wallet = {
+    publicKey: adminKp.publicKey,
+    async signTransaction(tx: any) {
+      tx.partialSign(adminKp);
+      return tx;
+    },
+    async signAllTransactions(txs: any[]) {
+      txs.forEach((t) => t.partialSign(adminKp));
+      return txs;
+    },
   };
 
+  const provider = new AnchorProvider(connection, wallet as any, {
+    commitment: "confirmed",
+  });
+
+  // ✅ 直接从链上 fetch IDL（你已经确认 anchor idl fetch OK）
+  const pointsProgram = (await Program.at(POINTS_PID, provider)) as any;
+
+  const [configPda] = PublicKey.findProgramAddressSync([SEED_CONFIG], POINTS_PID);
+  const [pointsPda] = PublicKey.findProgramAddressSync(
+    [SEED_POINTS, ownerPk.toBuffer()],
+    POINTS_PID
+  );
+
+  // ---- call add_points (admin signer) ----
   try {
-    const r = await callAward();
-    return { ok: true as const, tx: r.tx, usedMethod: r.fnName, memo: r.memo };
+    const tx = await pointsProgram.methods
+      .addPoints(new BN(amount))
+      .accounts({
+        config: configPda,
+        points: pointsPda,
+        owner: ownerPk,               // ✅ 不需要签名
+        authority: adminKp.publicKey, // ✅ 唯一 signer
+      })
+      .rpc();
+
+    return { ok: true as const, tx, configPda: configPda.toBase58(), pointsPda: pointsPda.toBase58() };
   } catch (e: any) {
     const msg = String(e?.message || e);
 
-    const needInitMissionSigner =
-      msg.includes("AccountNotInitialized") ||
-      msg.includes("mission_signer") ||
-      msg.includes("3012");
-
-    if (!needInitMissionSigner) {
-      return { ok: false as const, error: msg };
-    }
-
-    try {
-      const { fnName, fn } = pickMethod(missionProgram, "init_mission_signer");
-
-      await fn()
-        .accounts({
-          missionSigner: missionSignerPda,
-          payer: provider.wallet.publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
-        })
-        .rpc();
-
-      const r2 = await callAward();
+    // 常见：points 账号没 init（用户没点过初始化）
+    if (msg.toLowerCase().includes("accountnotfound") || msg.toLowerCase().includes("could not find account")) {
       return {
-        ok: true as const,
-        tx: r2.tx,
-        usedMethod: r2.fnName,
-        memo: r2.memo,
-        didInitMissionSigner: true as const,
-        usedInitMethod: fnName,
+        ok: false as const,
+        error: "points_not_initialized_for_owner",
+        hint: "Owner must run initialize_points once (from frontend) before admin can add_points.",
+        details: msg,
+        pointsPda: pointsPda.toBase58(),
       };
-    } catch (e2: any) {
-      return { ok: false as const, error: String(e2?.message || e2) };
     }
+
+    return { ok: false as const, error: msg, pointsPda: pointsPda.toBase58() };
   }
 }

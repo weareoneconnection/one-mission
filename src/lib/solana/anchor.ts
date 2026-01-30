@@ -1,81 +1,66 @@
 // src/lib/solana/anchor.ts
-import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import fs from "fs";
-import path from "path";
+import "server-only";
 
-// ✅ 你放 IDL 的路径：one-mission/idl/waoc_mission.json & waoc_points.json
-const IDL_MISSION_PATH = path.join(process.cwd(), "idl", "waoc_mission.json");
-const IDL_POINTS_PATH = path.join(process.cwd(), "idl", "waoc_points.json");
+import { Connection, Keypair } from "@solana/web3.js";
+import fs from "node:fs";
 
-function loadIdl(p: string) {
-  const raw = fs.readFileSync(p, "utf8");
-  return JSON.parse(raw);
+function mustEnv(name: string) {
+  const v = String(process.env[name] || "").trim();
+  if (!v) throw new Error(`missing_env:${name}`);
+  return v;
 }
 
-/**
- * ✅ Node server 用的 wallet（从本机 keypair 或 env 读取）
- * 方案 A：默认读 ~/.config/solana/id.json
- * 方案 B：设置 env SOLANA_KEYPAIR=/abs/path/to/keypair.json
- */
-function loadKeypair(): Keypair {
-  const kpPath =
-    process.env.SOLANA_KEYPAIR ||
-    path.join(process.env.HOME || "", ".config", "solana", "id.json");
-  const secret = JSON.parse(fs.readFileSync(kpPath, "utf8"));
-  return Keypair.fromSecretKey(Uint8Array.from(secret));
-}
-
-class NodeWallet implements anchor.Wallet {
-  constructor(readonly payer: Keypair) {}
-  get publicKey() {
-    return this.payer.publicKey;
-  }
-  async signTransaction(tx: any) {
-    tx.partialSign(this.payer);
-    return tx;
-  }
-  async signAllTransactions(txs: any[]) {
-    txs.forEach((t) => t.partialSign(this.payer));
-    return txs;
-  }
-}
-
-export function getProvider() {
-  const rpc =
+function getRpcUrl() {
+  return (
     process.env.SOLANA_RPC_URL ||
     process.env.NEXT_PUBLIC_SOLANA_RPC_URL ||
-    "https://api.devnet.solana.com";
-
-  const connection = new Connection(rpc, "confirmed");
-  const wallet = new NodeWallet(loadKeypair());
-
-  return new anchor.AnchorProvider(connection, wallet, {
-    commitment: "confirmed",
-  });
+    "https://api.mainnet-beta.solana.com"
+  );
 }
 
 /**
- * ✅ 关键：你当前 anchor 版本是 2 参数 Program(idl, provider)
- * 所以必须把 programId 写进 idl.metadata.address
+ * ✅ 支持 3 种写法：
+ * 1) WAOC_ADMIN_SECRET_JSON='[1,2,3,...]'                 (数组 JSON)
+ * 2) WAOC_ADMIN_SECRET_JSON='{"secretKey":[...]}'
+ * 3) WAOC_ADMIN_SECRET_JSON='/abs/path/to/id.json'        (文件路径)
  */
-function attachAddressToIdl(idl: any, programId: PublicKey) {
-  if (!idl.metadata) idl.metadata = {};
-  idl.metadata.address = programId.toBase58();
-  return idl;
+function loadKeypairFromEnv(envName: string): Keypair {
+  const raw = mustEnv(envName);
+
+  // a) looks like json array
+  const s = raw.trim();
+  if (s.startsWith("[")) {
+    const arr = JSON.parse(s);
+    return Keypair.fromSecretKey(Uint8Array.from(arr));
+  }
+
+  // b) json object
+  if (s.startsWith("{")) {
+    const obj = JSON.parse(s);
+    const arr = obj?.secretKey || obj?.secret_key || obj?.secret;
+    if (!arr) throw new Error(`invalid_${envName}:missing_secretKey`);
+    return Keypair.fromSecretKey(Uint8Array.from(arr));
+  }
+
+  // c) treat as path
+  if (!fs.existsSync(s)) {
+    throw new Error(`ENOENT: no such file or directory, open '${s}'`);
+  }
+  const file = JSON.parse(fs.readFileSync(s, "utf8"));
+  return Keypair.fromSecretKey(Uint8Array.from(file));
 }
 
-export function getWaocMissionProgram(provider: anchor.AnchorProvider) {
-  const programId = new PublicKey(process.env.WAOC_MISSION_PROGRAM_ID!);
-  const idl = attachAddressToIdl(loadIdl(IDL_MISSION_PATH), programId);
+export async function getLocalProvider() {
+  // ✅ 动态 import，避免 Next/Turbopack 在非 node 环境解析 Anchor 导致奇怪报错
+  const anchor = await import("@coral-xyz/anchor");
 
-  // ✅ 两参构造（符合你的 anchor 版本）
-  return new anchor.Program(idl as anchor.Idl, provider);
-}
+  const connection = new Connection(getRpcUrl(), "confirmed");
+  const kp = loadKeypairFromEnv("WAOC_ADMIN_SECRET_JSON");
+  const wallet = new anchor.Wallet(kp);
 
-export function getWaocPointsProgram(provider: anchor.AnchorProvider) {
-  const programId = new PublicKey(process.env.WAOC_POINTS_PROGRAM_ID!);
-  const idl = attachAddressToIdl(loadIdl(IDL_POINTS_PATH), programId);
+  const provider = new anchor.AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+  });
 
-  return new anchor.Program(idl as anchor.Idl, provider);
+  return { anchor, provider };
 }

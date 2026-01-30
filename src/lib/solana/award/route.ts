@@ -9,19 +9,37 @@ import {
   WAOC_MISSION_PROGRAM_ID,
 } from "@/lib/solana/config";
 
+/**
+ * ⚠️ PRODUCTION SAFE
+ * This route does NOT write on-chain.
+ * It only validates params and returns PDAs for admin/offline execution.
+ */
 export async function POST(req: Request) {
   try {
     const body = await req.json();
     const wallet = String(body.wallet || "");
     const amount = Number(body.amount || 0);
 
-    if (!wallet) return NextResponse.json({ ok: false, error: "missing wallet" }, { status: 400 });
-    if (!Number.isFinite(amount) || amount <= 0)
-      return NextResponse.json({ ok: false, error: "invalid amount" }, { status: 400 });
+    if (!wallet) {
+      return NextResponse.json(
+        { ok: false, error: "missing wallet" },
+        { status: 400 }
+      );
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return NextResponse.json(
+        { ok: false, error: "invalid amount" },
+        { status: 400 }
+      );
+    }
 
     const owner = new PublicKey(wallet);
-    const program = getWaocMissionProgram();
 
+    // ✅ readonly program (must await)
+    const program = await getWaocMissionProgram();
+
+    // ---- PDAs (deterministic, no signing) ----
     const [configPda] = PublicKey.findProgramAddressSync(
       [SEED_POINTS_CONFIG],
       WAOC_POINTS_PROGRAM_ID
@@ -37,28 +55,30 @@ export async function POST(req: Request) {
       WAOC_MISSION_PROGRAM_ID
     );
 
-    const tx = await program.methods
-      .awardPoints(new (program.provider as any).BN(amount))
-      .accounts({
-        waocPointsProgram: WAOC_POINTS_PROGRAM_ID,
-        pointsConfig: configPda,
-        points: pointsPda,
-        owner: owner,
-        missionSigner: missionSignerPda,
-        admin: program.provider.wallet.publicKey,
-      })
-      .rpc();
-
     return NextResponse.json({
       ok: true,
-      tx,
+
+      // input echo
       wallet: owner.toBase58(),
       amount,
+
+      // program info
+      missionProgramId: program.programId.toBase58(),
+      pointsProgramId: WAOC_POINTS_PROGRAM_ID.toBase58(),
+
+      // derived accounts
       configPda: configPda.toBase58(),
       pointsPda: pointsPda.toBase58(),
       missionSignerPda: missionSignerPda.toBase58(),
+
+      // hint for admin tooling
+      note:
+        "This endpoint is dry-run only. Execute award on-chain via local admin script.",
     });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: String(e?.message ?? e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: String(e?.message ?? e) },
+      { status: 500 }
+    );
   }
 }

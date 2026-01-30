@@ -3,10 +3,7 @@
 import React, { useMemo } from "react";
 import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
-import {
-  PhantomWalletAdapter,
-  SolflareWalletAdapter,
-} from "@solana/wallet-adapter-wallets";
+import { PhantomWalletAdapter, SolflareWalletAdapter } from "@solana/wallet-adapter-wallets";
 
 import "@solana/wallet-adapter-react-ui/styles.css";
 
@@ -21,17 +18,18 @@ function dedupeWalletsByName(list: any[]) {
   });
 }
 
+function pickEndpoint() {
+  const a = String(process.env.NEXT_PUBLIC_SOLANA_RPC || "").trim();
+  const b = String(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "").trim();
+  const c = String(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "").trim(); // 你原本用的同名也保留（兼容）
+  return a || b || c || "https://api.mainnet-beta.solana.com";
+}
+
 export default function WalletProviders({ children }: { children: React.ReactNode }) {
-  const endpoint = useMemo(() => {
-    return (
-      process.env.NEXT_PUBLIC_SOLANA_RPC_URL ||
-      "https://api.mainnet-beta.solana.com"
-    );
-  }, []);
+  const endpoint = useMemo(() => pickEndpoint(), []);
 
   const wallets = useMemo(() => {
     const list = [new PhantomWalletAdapter(), new SolflareWalletAdapter()];
-    // ✅ 防止重复 key（包括你遇到的 MetaMask）
     return dedupeWalletsByName(list);
   }, []);
 

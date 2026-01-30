@@ -1,108 +1,109 @@
+// src/lib/server/adminSig.ts
 import bs58 from "bs58";
 import nacl from "tweetnacl";
-import { PublicKey } from "@solana/web3.js";
 
-function nowMs() {
-  return Date.now();
-}
+type Ok = { ok: true; wallet: string; action: string };
+type Err = {
+  ok: false;
+  error:
+    | "missing_admin_headers"
+    | "admin_action_not_allowed"
+    | "admin_signature_expired"
+    | "invalid_admin_signature"
+    | "invalid_admin_timestamp";
+};
+
+export type AdminAuth = Ok | Err;
 
 /**
- * ✅ Admin action 白名单
- * 不改结构，只集中管理
+ * ✅ 只允许“登录”这一个动作走签名头
+ * 目的：Admin Login 签一次，后续接口走 httpOnly session cookie，不再连续签名
+ *
+ * 你后端 session route：POST /api/mission/admin/session
  */
-const ADMIN_ACTIONS = new Set<string>([
-  "POST:/api/mission/admin/session", // ✅ 新增这一行（Admin Login）
-  "POST:/api/mission/approve",
-  "POST:/api/mission/reject",
-  "POST:/api/points/sync",
+const ALLOW_PREFIXES = new Set<string>([
+  "POST:/api/mission/admin/session",
 ]);
 
+// 防重放窗口（默认 5 分钟）
+const MAX_SKEW_MS = 5 * 60 * 1000;
 
-/**
- * 从 Request 推导 “规范 action”
- * 例：POST + /api/points/sync => POST:/api/points/sync
- */
-function inferAction(req: Request): string {
-  const method = (req.method || "GET").toUpperCase();
-  let pathname = "/";
-  try {
-    pathname = new URL(req.url).pathname;
-  } catch {}
-  return `${method}:${pathname}`;
+function getHeader(req: Request, name: string) {
+  // Next.js Headers 是 case-insensitive，但这里双取更稳
+  return req.headers.get(name) || req.headers.get(name.toLowerCase()) || "";
 }
 
-export function verifyAdminSignature(req: Request) {
-  const wallet = String(req.headers.get("x-admin-wallet") || "").trim();
-  const ts = String(req.headers.get("x-admin-timestamp") || "").trim();
-  const msg = String(req.headers.get("x-admin-msg") || "").trim();
-  const sig = String(req.headers.get("x-admin-signature") || "").trim();
+function parseActionPrefix(msg: string) {
+  // msg 可能是：POST:/api/mission/admin/session|body=...|cluster=...
+  // ✅ 只取第一个 | 前的内容作为 allowlist key
+  const first = msg.split("|", 1)[0] || "";
+  return first.trim();
+}
 
-  if (!wallet) return { ok: false as const, error: "missing_admin_wallet" };
-  if (!ts) return { ok: false as const, error: "missing_admin_timestamp" };
-  if (!msg) return { ok: false as const, error: "missing_admin_msg" };
-  if (!sig) return { ok: false as const, error: "missing_admin_signature" };
+function isFreshTimestamp(tsStr: string) {
+  const ts = Number(tsStr);
+  if (!Number.isFinite(ts)) return false;
+  const now = Date.now();
+  return Math.abs(now - ts) <= MAX_SKEW_MS;
+}
 
-  // ✅ 时间窗（5 分钟），防重放
-  const t = Number(ts);
-  if (!Number.isFinite(t)) return { ok: false as const, error: "bad_admin_timestamp" };
+/**
+ * ✅ 验证 Admin 签名头
+ * 规则（与你现有实现保持一致）：
+ * - 必须带：
+ *    x-admin-wallet
+ *    x-admin-msg
+ *    x-admin-timestamp (or x-admin-ts)
+ *    x-admin-signature (or x-admin-sig)
+ * - allowlist：只校验 msg 的前缀（METHOD:/api/xxx）
+ * - payload：`${msg}|${timestamp}`
+ * - signature：tweetnacl detached verify
+ */
+export async function verifyAdminSig(req: Request): Promise<AdminAuth> {
+  const wallet = getHeader(req, "x-admin-wallet");
+  const msg = getHeader(req, "x-admin-msg");
 
-  const drift = Math.abs(nowMs() - t);
-  if (drift > 5 * 60 * 1000) {
-    return { ok: false as const, error: "admin_timestamp_expired" };
+  const timestamp =
+    getHeader(req, "x-admin-timestamp") ||
+    getHeader(req, "x-admin-ts") ||
+    "";
+
+  const sig =
+    getHeader(req, "x-admin-signature") ||
+    getHeader(req, "x-admin-sig") ||
+    "";
+
+  if (!wallet || !msg || !timestamp || !sig) {
+    return { ok: false, error: "missing_admin_headers" };
   }
 
-  // ✅ 强约束：action 必须在白名单里
-  if (!ADMIN_ACTIONS.has(msg)) {
-    return {
-      ok: false as const,
-      error: "admin_action_not_allowed",
-      detail: msg,
-    };
+  // ✅ allowlist：只允许登录动作
+  const action = parseActionPrefix(msg);
+  if (!ALLOW_PREFIXES.has(action)) {
+    return { ok: false, error: "admin_action_not_allowed" };
   }
 
-  // ✅ 强校验：签名 action 必须等于当前请求 action
-  const inferred = inferAction(req);
-  if (msg !== inferred) {
-    return {
-      ok: false as const,
-      error: "admin_msg_mismatch",
-      signed: msg,
-      actual: inferred,
-    };
+  // ✅ 时间窗（防重放）
+  if (!isFreshTimestamp(timestamp)) {
+    return { ok: false, error: "admin_signature_expired" };
   }
 
-  // ✅ payload = msg|timestamp
-  const payload = `${msg}|${ts}`;
-
-  let pubkeyBytes: Uint8Array;
-  let sigBytes: Uint8Array;
-
+  // ✅ 验签：payload = msg|timestamp
   try {
-    pubkeyBytes = new PublicKey(wallet).toBytes();
+    const payload = `${msg}|${timestamp}`;
+
+    const sigBytes = bs58.decode(sig);
+    const pubBytes = bs58.decode(wallet);
+
+    const ok = nacl.sign.detached.verify(
+      Buffer.from(payload, "utf8"),
+      sigBytes,
+      pubBytes
+    );
+
+    if (!ok) return { ok: false, error: "invalid_admin_signature" };
+    return { ok: true, wallet, action };
   } catch {
-    return { ok: false as const, error: "bad_admin_wallet" };
+    return { ok: false, error: "invalid_admin_signature" };
   }
-
-  try {
-    sigBytes = bs58.decode(sig);
-  } catch {
-    return { ok: false as const, error: "bad_admin_signature" };
-  }
-
-  const ok = nacl.sign.detached.verify(
-    Buffer.from(payload, "utf8"),
-    sigBytes,
-    pubkeyBytes
-  );
-
-  if (!ok) {
-    return { ok: false as const, error: "admin_signature_invalid" };
-  }
-
-  return {
-    ok: true as const,
-    wallet,
-    action: msg,
-    ts: t,
-  };
 }

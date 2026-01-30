@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { verifyAdminSignature } from "@/lib/server/adminSig";
+import { verifyAdminSig } from "@/lib/server/adminSig";
 import {
   ADMIN_SESSION_COOKIE,
   createAdminSession,
@@ -20,8 +20,8 @@ function noStoreJson(data: any, status = 200) {
 }
 
 export async function POST(req: Request) {
-  // ✅ 用你现有的签名头做一次“管理员登录”
-  const auth = verifyAdminSignature(req);
+  // ✅ 只在登录时验签
+  const auth = await verifyAdminSig(req);
   if (!auth.ok) return noStoreJson({ ok: false, error: auth.error }, 401);
 
   const created = await createAdminSession(auth.wallet);
@@ -29,7 +29,6 @@ export async function POST(req: Request) {
 
   const res = noStoreJson({ ok: true, isAdmin: true, wallet: created.wallet, ttl: created.ttl });
 
-  // ✅ httpOnly cookie：前端拿不到，安全；30min 自动失效
   res.cookies.set({
     name: ADMIN_SESSION_COOKIE,
     value: created.token,
@@ -44,15 +43,13 @@ export async function POST(req: Request) {
 }
 
 export async function DELETE(req: Request) {
-  const cookie = (req as any).cookies?.get?.(ADMIN_SESSION_COOKIE)?.value;
-  // Next.js 的 Request 在 route.ts 里不一定有 cookies getter，兼容处理：
+  // ✅ logout 清 session
   const token =
-    cookie ||
     String(req.headers.get("cookie") || "")
       .split(";")
       .map((s) => s.trim())
       .find((x) => x.startsWith(ADMIN_SESSION_COOKIE + "="))
-      ?.split("=")[1];
+      ?.split("=")[1] || "";
 
   await destroyAdminSession(token);
 
@@ -70,7 +67,7 @@ export async function DELETE(req: Request) {
 }
 
 export async function GET(req: Request) {
-  // ✅ 查询当前是否已登录 admin（用于前端显示 Admin tab / gate）
+  // ✅ 前端用来判断是否已登录
   const token =
     String(req.headers.get("cookie") || "")
       .split(";")
