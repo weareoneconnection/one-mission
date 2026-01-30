@@ -4,8 +4,8 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import type { PublicKey as PK, Transaction } from "@solana/web3.js";
 import {
   SOLANA_RPC,
-  WAOC_POINTS_PROGRAM_ID,
-  WAOC_MISSION_PROGRAM_ID,
+  WAOC_POINTS_PROGRAM_ID_STR,
+  WAOC_MISSION_PROGRAM_ID_STR,
 } from "./config";
 
 export type MinimalAnchorWallet = {
@@ -50,7 +50,7 @@ function asPubkey(id: string, name: string) {
 export async function getWaocPointsProgram(provider = getReadonlyProvider()) {
   if (!_pointsProgram) {
     _pointsProgram = await Program.at(
-      asPubkey(WAOC_POINTS_PROGRAM_ID, "WAOC_POINTS_PROGRAM_ID"),
+      asPubkey(WAOC_POINTS_PROGRAM_ID_STR, "WAOC_POINTS_PROGRAM_ID"),
       provider
     );
   }
@@ -63,7 +63,7 @@ export async function getWaocPointsProgram(provider = getReadonlyProvider()) {
 export async function getWaocMissionProgram(provider = getReadonlyProvider()) {
   if (!_missionProgram) {
     _missionProgram = await Program.at(
-      asPubkey(WAOC_MISSION_PROGRAM_ID, "WAOC_MISSION_PROGRAM_ID"),
+      asPubkey(WAOC_MISSION_PROGRAM_ID_STR, "WAOC_MISSION_PROGRAM_ID"),
       provider
     );
   }
@@ -73,7 +73,10 @@ export async function getWaocMissionProgram(provider = getReadonlyProvider()) {
 /**
  * ✅ Write-enabled provider (wallet signs)
  */
-export function getWalletProvider(wallet: MinimalAnchorWallet, connection?: Connection) {
+export function getWalletProvider(
+  wallet: MinimalAnchorWallet,
+  connection?: Connection
+) {
   const conn = connection ?? getConnection();
   return new AnchorProvider(conn, wallet as any, { commitment: "confirmed" });
 }
@@ -88,7 +91,7 @@ export async function getWaocPointsProgramWithWallet(
 ) {
   const provider = getWalletProvider(wallet, connection);
   const program = await Program.at(
-    asPubkey(WAOC_POINTS_PROGRAM_ID, "WAOC_POINTS_PROGRAM_ID"),
+    asPubkey(WAOC_POINTS_PROGRAM_ID_STR, "WAOC_POINTS_PROGRAM_ID"),
     provider
   );
   return program;
