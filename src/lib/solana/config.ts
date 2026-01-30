@@ -54,6 +54,7 @@ export const WAOC_MISSION_PROGRAM_ID: string = must("WAOC_MISSION_PROGRAM_ID");
 export const SEED_POINTS = "points";     // points PDA
 export const SEED_LEDGER = "ledger";     // optional: history / ledger PDA
 export const SEED_CONFIG = "config";     // optional: config PDA
+export const SEED_POINTS_CONFIG = SEED_CONFIG; // backward-compatible alias
 
 /* ============================================================
  * Feature Flags
