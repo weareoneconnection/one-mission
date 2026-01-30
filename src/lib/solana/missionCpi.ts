@@ -20,16 +20,30 @@ function mustPkEnv(name: string) {
 }
 
 function readKeypairFromEnvPath(envName: string) {
-  const p = mustEnv(envName);
-  const abs = p.startsWith("~")
-    ? path.join(process.env.HOME || "", p.slice(1))
-    : p;
+  const v = mustEnv(envName);
+
+  // ✅ 情况 A：Vercel / CI —— 直接给 JSON array
+  if (v.trim().startsWith("[")) {
+    const arr = JSON.parse(v);
+    if (!Array.isArray(arr)) {
+      throw new Error(`invalid_inline_keypair:${envName}`);
+    }
+    return Keypair.fromSecretKey(Uint8Array.from(arr));
+  }
+
+  // ✅ 情况 B：本地 —— 文件路径
+  const abs = v.startsWith("~")
+    ? path.join(process.env.HOME || "", v.slice(1))
+    : v;
 
   const raw = fs.readFileSync(abs, "utf8");
   const arr = JSON.parse(raw);
-  if (!Array.isArray(arr)) throw new Error(`invalid_keypair_json:${envName}`);
+  if (!Array.isArray(arr)) {
+    throw new Error(`invalid_keypair_json:${envName}`);
+  }
   return Keypair.fromSecretKey(Uint8Array.from(arr));
 }
+
 
 async function getAnchor() {
   // ✅ 用 dynamic import 绕开 turbopack 对 anchor named export 的静态检查
