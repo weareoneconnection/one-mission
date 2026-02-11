@@ -114,15 +114,18 @@ export async function awardPointsOnchain(params: {
 
   // ---- call add_points (admin signer) ----
   try {
-    const tx = await pointsProgram.methods
-      .addPoints(new BN(amount))
-      .accounts({
-        config: configPda,
-        points: pointsPda,
-        owner: ownerPk,               // ✅ 不需要签名
-        authority: adminKp.publicKey, // ✅ 唯一 signer
-      })
-      .rpc();
+    const tx = await withBlockhashRetry(() =>
+  pointsProgram.methods
+    .addPoints(new BN(amount))
+    .accounts({
+      config: configPda,
+      points: pointsPda,
+      owner: ownerPk,
+      authority: adminKp.publicKey,
+    })
+    .rpc()
+);
+
 
     return { ok: true as const, tx, configPda: configPda.toBase58(), pointsPda: pointsPda.toBase58() };
   } catch (e: any) {
@@ -140,5 +143,22 @@ export async function awardPointsOnchain(params: {
     }
 
     return { ok: false as const, error: msg, pointsPda: pointsPda.toBase58() };
+  }
+}
+async function withBlockhashRetry<T>(
+  fn: () => Promise<T>,
+  retries = 2
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (
+      retries > 0 &&
+      msg.toLowerCase().includes("blockhash")
+    ) {
+      return await withBlockhashRetry(fn, retries - 1);
+    }
+    throw e;
   }
 }

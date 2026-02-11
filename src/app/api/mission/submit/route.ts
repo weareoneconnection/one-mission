@@ -1,10 +1,16 @@
 import { NextResponse } from "next/server";
 import { getRedis } from "@/lib/server/redis";
 
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getAssociatedTokenAddress } from "@solana/spl-token";
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
+/* =========================
+   Storage Driver
+========================= */
 type Driver = "memory" | "kv";
 
 function pickDriver(): Driver {
@@ -12,6 +18,9 @@ function pickDriver(): Driver {
   return v === "kv" ? "kv" : "memory";
 }
 
+/* =========================
+   Date / Mission Helpers
+========================= */
 function pad2(n: number) {
   return String(n).padStart(2, "0");
 }
@@ -43,6 +52,9 @@ function periodKeyFor(period: "once" | "daily" | "weekly") {
   return "once";
 }
 
+/* =========================
+   Memory store
+========================= */
 type MemDB = { kv: Map<string, any> };
 function getMemDB(): MemDB {
   const g = globalThis as unknown as { __ONE_MISSION_MEMDB__?: MemDB };
@@ -62,10 +74,16 @@ async function memLPush(key: string, val: any, maxLen = 500) {
   await memSet(key, arr.slice(0, maxLen));
 }
 
+/* =========================
+   KV client
+========================= */
 async function kvClient() {
   return getRedis();
 }
 
+/* =========================
+   Response helpers
+========================= */
 function noStoreJson(data: any, status = 200) {
   const res = NextResponse.json(data, { status });
   res.headers.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -74,6 +92,9 @@ function noStoreJson(data: any, status = 200) {
   return res;
 }
 
+/* =========================
+   Sanitizers
+========================= */
 function s(v: any, max = 2000) {
   return String(v ?? "").slice(0, max);
 }
@@ -82,6 +103,9 @@ function asInt(v: any, d = 0) {
   return Number.isFinite(n) ? Math.trunc(n) : d;
 }
 
+/* =========================
+   Types
+========================= */
 type ProofFile = { name: string; type: string; size: number; dataUrl: string };
 
 type Body = {
@@ -107,6 +131,66 @@ function makeSubmissionId(now: number, wallet: string) {
   return `${now}-${wallet.slice(0, 6)}-${nonce}`;
 }
 
+/* =========================
+   ✅ WAOC gate (soft gate)
+   - only blocks submit when balance < MIN_WAOC_HOLD
+   - login/browse is front-end decision
+========================= */
+// env (recommended):
+// WAOC_MINT=82gi7mybA1yHi56FcCC9wvTPzew5hsxP2wdHv4nYpump
+// MIN_WAOC_HOLD=50000
+// SOLANA_RPC=https://api.mainnet-beta.solana.com
+
+function getWaocMint(): PublicKey | null {
+  const mint = s(process.env.WAOC_MINT || "", 128).trim();
+  if (!mint) return null;
+  try {
+    return new PublicKey(mint);
+  } catch {
+    return null;
+  }
+}
+
+function getMinWaocHold() {
+  const v = Number(process.env.MIN_WAOC_HOLD ?? 50000);
+  return Number.isFinite(v) ? Math.max(0, v) : 50000;
+}
+
+function getRpc() {
+  return s(process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com", 2000).trim();
+}
+
+// ✅ Connection 缓存（同一 Node 实例内复用）
+function getConn() {
+  const g = globalThis as unknown as { __WAOC_CONN__?: Connection; __WAOC_RPC__?: string };
+  const rpc = getRpc();
+  if (!g.__WAOC_CONN__ || g.__WAOC_RPC__ !== rpc) {
+    g.__WAOC_CONN__ = new Connection(rpc, "confirmed");
+    g.__WAOC_RPC__ = rpc;
+  }
+  return g.__WAOC_CONN__!;
+}
+
+async function fetchWaocUiAmount(wallet: string): Promise<number> {
+  const mint = getWaocMint();
+  if (!mint) return 0; // 没配置就不拦（建议配置）
+  const connection = getConn();
+
+  const owner = new PublicKey(wallet);
+  const ata = await getAssociatedTokenAddress(mint, owner);
+
+  // ATA 不存在会抛错；这里兜底为 0
+  try {
+    const bal = await connection.getTokenAccountBalance(ata);
+    return bal.value.uiAmount ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/* =========================
+   POST
+========================= */
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as Body;
@@ -118,6 +202,23 @@ export async function POST(req: Request) {
 
     const m = parseMission(missionIdRaw);
     const pKey = s(body.periodKey || "", 64).trim() || periodKeyFor(m.period);
+
+    // ✅ WAOC gate (server-side, not bypassable)
+    const minHold = getMinWaocHold();
+    if (minHold > 0) {
+      let waocBal = 0;
+      try {
+        waocBal = await fetchWaocUiAmount(wallet);
+      } catch {
+        waocBal = 0;
+      }
+      if (waocBal < minHold) {
+        return noStoreJson(
+          { ok: false, error: "waoc_required", required: minHold, balance: waocBal },
+          403
+        );
+      }
+    }
 
     const now = Date.now();
     const driver = pickDriver();
@@ -149,6 +250,7 @@ export async function POST(req: Request) {
 
     const submissionId = makeSubmissionId(now, wallet);
 
+    // ✅ 保持你结构不变
     const item = {
       submissionId,
       ts: now,
@@ -165,7 +267,15 @@ export async function POST(req: Request) {
       const redis = await kvClient();
       const existed = await (redis as any).get(dedupKey);
       if (existed) {
-        return noStoreJson({ ok: true, pending: true, duplicated: true, wallet, missionId: m.id, period: m.period, periodKey: pKey });
+        return noStoreJson({
+          ok: true,
+          pending: true,
+          duplicated: true,
+          wallet,
+          missionId: m.id,
+          period: m.period,
+          periodKey: pKey,
+        });
       }
 
       await (redis as any).set(dedupKey, "1");
@@ -179,23 +289,49 @@ export async function POST(req: Request) {
       } else {
         const raw = await (redis as any).get(kPending);
         let arr: any[] = [];
-        try { arr = raw ? JSON.parse(raw) : []; } catch {}
+        try {
+          arr = raw ? JSON.parse(raw) : [];
+        } catch {}
         arr.unshift(item);
         arr = arr.slice(0, 1000);
         await (redis as any).set(kPending, JSON.stringify(arr));
       }
 
-      return noStoreJson({ ok: true, pending: true, submissionId, wallet, missionId: m.id, period: m.period, periodKey: pKey });
+      return noStoreJson({
+        ok: true,
+        pending: true,
+        submissionId,
+        wallet,
+        missionId: m.id,
+        period: m.period,
+        periodKey: pKey,
+      });
     }
 
     const existed = await memGet(dedupKey);
     if (existed) {
-      return noStoreJson({ ok: true, pending: true, duplicated: true, wallet, missionId: m.id, period: m.period, periodKey: pKey });
+      return noStoreJson({
+        ok: true,
+        pending: true,
+        duplicated: true,
+        wallet,
+        missionId: m.id,
+        period: m.period,
+        periodKey: pKey,
+      });
     }
     await memSet(dedupKey, true);
     await memLPush(kPending, item, 1000);
 
-    return noStoreJson({ ok: true, pending: true, submissionId, wallet, missionId: m.id, period: m.period, periodKey: pKey });
+    return noStoreJson({
+      ok: true,
+      pending: true,
+      submissionId,
+      wallet,
+      missionId: m.id,
+      period: m.period,
+      periodKey: pKey,
+    });
   } catch (e: any) {
     return noStoreJson({ ok: false, error: e?.message ?? "submit_error" }, 500);
   }

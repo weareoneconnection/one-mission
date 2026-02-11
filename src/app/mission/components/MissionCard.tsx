@@ -114,6 +114,73 @@ async function fileToDataUrl(file: File) {
   return `data:${file.type};base64,${base64}`;
 }
 
+/* =========================
+   ✅ Error UX Upgrade (no structure change)
+========================= */
+const WAOC_MINT = "82gi7mybA1yHi56FcCC9wvTPzew5hsxP2wdHv4nYpump";
+const WAOC_BUY_URL = `https://jup.ag/swap/SOL-${WAOC_MINT}`;
+
+function fmtNum(n: number) {
+  return new Intl.NumberFormat("en-US").format(Number.isFinite(n) ? n : 0);
+}
+
+function parseErrPayload(raw: any) {
+  // raw may be:
+  // - string ("waoc_required")
+  // - Error.message string
+  // - object { error, required, balance }
+  // - object from API { ok:false, error, required, balance }
+  if (!raw) return { code: "", payload: {} as any };
+
+  if (typeof raw === "string") {
+    // sometimes string contains "waoc_required (HTTP 403)" etc
+    const code = raw.includes("waoc_required") ? "waoc_required" : raw;
+    return { code, payload: {} as any, message: raw };
+  }
+
+  const code = String(raw?.error || raw?.code || raw?.message || "").trim();
+  return { code, payload: raw };
+}
+
+function humanizeError(raw: any) {
+  const { code, payload, message } = parseErrPayload(raw);
+
+  // ✅ WAOC gate
+  if (code === "waoc_required" || (message && message.includes("waoc_required"))) {
+    const required = Number(payload?.required ?? 50000);
+    const balance = Number(payload?.balance ?? 0);
+    const diff = Math.max(0, required - balance);
+
+    return {
+      code: "waoc_required",
+      title: "WAOC required to submit",
+      detail:
+        diff > 0
+          ? `Hold at least ${fmtNum(required)} WAOC. You have ${fmtNum(balance)} (need +${fmtNum(diff)} more).`
+          : `Hold at least ${fmtNum(required)} WAOC. Your balance is ${fmtNum(balance)}.`,
+      required,
+      balance,
+    };
+  }
+
+  // wallet missing
+  if (code === "missing wallet" || code === "missing_wallet") {
+    return {
+      code: "missing_wallet",
+      title: "Wallet not connected",
+      detail: "Connect your wallet and try again.",
+    };
+  }
+
+  // fallback: keep original message but nicer
+  const safe = (message || code || "unknown").slice(0, 240);
+  return {
+    code: code || "unknown",
+    title: "Action failed",
+    detail: safe,
+  };
+}
+
 export default function MissionCard({
   mission,
   onVerify,
@@ -125,7 +192,7 @@ export default function MissionCard({
   const err = errors[mission.id];
 
   const [dismissedError, setDismissedError] = useState(false);
-  const [localErr, setLocalErr] = useState<string | null>(null);
+  const [localErr, setLocalErr] = useState<any>(null); // ✅ allow object payload too
 
   const period = useMemo(() => parsePeriod(mission.id), [mission.id]);
 
@@ -182,7 +249,7 @@ export default function MissionCard({
   const [note, setNote] = useState("");
   const [files, setFiles] = useState<{ name: string; type: string; size: number; dataUrl: string }[]>([]);
   const [submitting, setSubmitting] = useState(false);
-  const [modalErr, setModalErr] = useState<string | null>(null);
+  const [modalErr, setModalErr] = useState<any>(null); // ✅ object payload
 
   async function onPickFiles(list: FileList | null) {
     if (!list) return;
@@ -204,7 +271,7 @@ export default function MissionCard({
     }
 
     if (next.length === 0) {
-      setModalErr("Only PNG/JPG/WebP screenshots up to 2MB are allowed.");
+      setModalErr({ error: "file_invalid" });
       return;
     }
 
@@ -212,51 +279,65 @@ export default function MissionCard({
   }
 
   async function submitProof() {
-    if (!walletAddress) return;
-    setSubmitting(true);
-    setModalErr(null);
+  if (!walletAddress) return;
+  setSubmitting(true);
+  setModalErr(null);
 
-    try {
-      const pk = periodKeyFor(period);
+  try {
+    const pk = periodKeyFor(period);
 
-      const r = await fetch("/api/mission/submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({
-          wallet: walletAddress,
-          missionId: mission.id,
-          periodKey: pk,
-          points: mission.basePoints,
-          proofUrl: proofUrl.trim(),
-          note: note.trim(),
-          files,
-        }),
-      });
+    const r = await fetch("/api/mission/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        wallet: walletAddress,
+        missionId: mission.id,
+        periodKey: pk,
+        points: mission.basePoints,
+        proofUrl: proofUrl.trim(),
+        note: note.trim(),
+        files,
+      }),
+    });
 
-      const j = await r.json().catch(() => ({} as any));
-      if (!r.ok || !j?.ok) throw new Error(j?.error || `Submit failed (HTTP ${r.status})`);
+    const j = await r.json().catch(() => ({} as any));
 
-      if (pendingKey) sessionStorage.setItem(pendingKey, "1");
-      setPending(true);
+    // ✅ 关键：这里直接把“正确的 payload”准备好
+    if (!r.ok || !j?.ok) {
+      const payload =
+        j && typeof j === "object"
+          ? j // 后端 payload（含 error/required/balance）
+          : { error: String(j || "").trim() || `http_${r.status}` };
 
-      setProofUrl("");
-      setNote("");
-      setFiles([]);
-      setOpen(false);
-    } catch (e: any) {
-      setModalErr(e?.message ?? "Submit error");
-    } finally {
-      setSubmitting(false);
+      // 如果后端只返回字符串/空，也至少带上 http 状态
+      if (!payload.error) payload.error = `http_${r.status}`;
+
+      setModalErr(payload);
+      return; // ✅ 不 throw，避免 catch 再兜底覆盖
     }
+
+    if (pendingKey) sessionStorage.setItem(pendingKey, "1");
+    setPending(true);
+
+    setProofUrl("");
+    setNote("");
+    setFiles([]);
+    setOpen(false);
+  } catch (e: any) {
+    // ✅ 网络错误 / fetch 抛错 才会到这里
+    const msg = String(e?.message || "").trim();
+    if (msg.includes("waoc_required")) setModalErr({ error: "waoc_required" });
+    else if (msg) setModalErr({ error: msg });
+    else setModalErr({ error: "submit_error" });
+  } finally {
+    setSubmitting(false);
   }
+}
+
 
   /**
    * ✅ Onchain one-step: call YOUR /api/mission/verify (the code you pasted)
-   * It will do:
-   *  - dedup by period
-   *  - verifyOnchainMission(...)
-   *  - apply points/leaderboard/ledger
    */
   async function claimOnchainViaVerifyRoute() {
     if (!walletAddress) return;
@@ -274,19 +355,21 @@ export default function MissionCard({
         address: walletAddress,
         points: mission.basePoints,
         basePoints: mission.basePoints,
-        // 传不传 periodKey 都行，你后端自己算；这里带上更利于你排查
         periodKey: pk,
       }),
     });
 
     const j = await r.json().catch(() => ({} as any));
     if (!r.ok || !j?.ok) {
-      throw new Error(j?.error ? `${j.error} (HTTP ${r.status})` : `HTTP ${r.status}`);
+      // ✅ keep payload
+      throw j?.error ? j : { error: j?.error || `http_${r.status}` };
     }
 
-    // ✅ 最稳：避免外层 onVerify 触发旧逻辑再次打 /api/mission/verify(旧版)/401
     window.location.reload();
   }
+
+  const topError = showError ? humanizeError(localErr || err) : null;
+  const modalError = modalErr ? humanizeError(modalErr) : null;
 
   return (
     <div
@@ -357,7 +440,8 @@ export default function MissionCard({
                     onVerify();
                   }
                 } catch (e: any) {
-                  setLocalErr(e?.message ?? "Verify failed");
+                  // ✅ keep full payload
+                  setLocalErr(e?.error ? (typeof e === "string" ? { error: e } : e) : { error: e?.message ?? "Verify failed" });
                 }
               }}
               className={[
@@ -375,17 +459,34 @@ export default function MissionCard({
         </div>
       </div>
 
-      {/* Error box */}
-      {showError ? (
-        <div className="mt-4 rounded-xl border border-red-200 bg-red-50/70 px-4 py-3 text-sm text-red-800 flex items-start justify-between gap-3">
+      {/* Error box (upgraded, same structure) */}
+      {showError && topError ? (
+        <div className="mt-4 rounded-xl border border-rose-200 bg-rose-50/70 px-4 py-3 text-sm text-rose-900 flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <div className="font-semibold">Verification failed</div>
-            <div className="text-red-800/80">{localErr || err}</div>
+            <div className="font-semibold">{topError.title}</div>
+            <div className="text-rose-900/80">{topError.detail}</div>
+
+            {topError.code === "waoc_required" ? (
+              <div className="mt-3 flex flex-wrap gap-2">
+                <a
+                  href={WAOC_BUY_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center justify-center rounded-xl bg-black px-4 py-2 text-xs font-semibold text-white hover:bg-black/90"
+                >
+                  Buy WAOC on Jupiter
+                </a>
+                <span className="inline-flex items-center rounded-xl border border-zinc-900/10 bg-white px-3 py-2 text-xs text-zinc-700">
+                  Mint: {WAOC_MINT.slice(0, 4)}…{WAOC_MINT.slice(-4)}
+                </span>
+              </div>
+            ) : null}
           </div>
+
           <button
             type="button"
             onClick={() => setDismissedError(true)}
-            className="shrink-0 text-xs underline text-red-700"
+            className="shrink-0 text-xs underline text-rose-700"
           >
             Dismiss
           </button>
@@ -477,8 +578,32 @@ export default function MissionCard({
                 />
               </div>
 
-              {modalErr ? (
-                <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">{modalErr}</div>
+              {/* Modal error (upgraded) */}
+              {modalErr && modalError ? (
+                <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+                  <div className="font-semibold">{modalError.title}</div>
+                  <div className="text-rose-900/80">{modalError.detail}</div>
+
+                  {modalError.code === "waoc_required" ? (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <a
+                        href={WAOC_BUY_URL}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center justify-center rounded-xl bg-black px-4 py-2 text-xs font-semibold text-white hover:bg-black/90"
+                      >
+                        Buy WAOC on Jupiter
+                      </a>
+                      <button
+                        type="button"
+                        className="rounded-xl border border-zinc-900/15 bg-white px-4 py-2 text-xs font-semibold text-zinc-900 hover:bg-zinc-50"
+                        onClick={() => setModalErr(null)}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               ) : null}
 
               <div className="flex items-center justify-end gap-3 pt-2">

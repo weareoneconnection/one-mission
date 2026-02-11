@@ -102,6 +102,16 @@ export default function MissionsPage() {
     updatedAt?: number;
   } | null>(null);
 
+  // ✅ WAOC gate modal state (soft gate)
+  const [waocGate, setWaocGate] = useState<null | {
+    required: number;
+    balance: number;
+  }>(null);
+
+  // ✅ WAOC mint + buy link (与你后端一致)
+  const WAOC_MINT = "82gi7mybA1yHi56FcCC9wvTPzew5hsxP2wdHv4nYpump";
+  const buyUrl = `https://jup.ag/swap/SOL-${WAOC_MINT}`;
+
   const refreshExtraStats = async (w?: string | null) => {
     const addr = (w || walletAddress || "").trim();
     if (!addr) return;
@@ -114,7 +124,8 @@ export default function MissionsPage() {
       const j = await r.json().catch(() => null);
       if (r.ok && j?.ok) {
         setExtra({
-          uniqueCompleted: typeof j.uniqueCompleted === "number" ? j.uniqueCompleted : undefined,
+          uniqueCompleted:
+            typeof j.uniqueCompleted === "number" ? j.uniqueCompleted : undefined,
           streak: j.streak || undefined,
           updatedAt: typeof j.updatedAt === "number" ? j.updatedAt : undefined,
         });
@@ -131,11 +142,52 @@ export default function MissionsPage() {
       return;
     }
     refreshExtraStats(walletAddress);
-    // optional: poll every 30s (safe)
     const t = setInterval(() => refreshExtraStats(walletAddress), 30_000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [walletAddress]);
+
+  // ✅ soft gate: check WAOC before verify/submit actions
+  const ensureWaocEligible = async () => {
+    const addr = (walletAddress || "").trim();
+    if (!addr) return false;
+
+    try {
+      // 你项目里已经有 src/app/api/check-waoc
+      const r = await fetch("/api/check-waoc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ wallet: addr }),
+      });
+
+      const j = await r.json().catch(() => ({}));
+
+      // 后端 gate: 403 + waoc_required
+      if (!r.ok && r.status === 403 && j?.error === "waoc_required") {
+        setWaocGate({
+          required: Number(j?.required ?? 50000),
+          balance: Number(j?.balance ?? 0),
+        });
+        return false;
+      }
+
+      // 兼容 /api/check-waoc 返回 { ok:true, eligible:false, balance }
+      if (r.ok && j?.ok === true && j?.eligible === false) {
+        setWaocGate({
+          required: Number(j?.required ?? j?.minHold ?? 50000),
+          balance: Number(j?.balance ?? 0),
+        });
+        return false;
+      }
+
+      return true;
+    } catch {
+      // 如果检查失败（网络/RPC），为了不误伤用户，这里默认放行
+      // 但真正 submit 后端仍会拦截
+      return true;
+    }
+  };
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -188,8 +240,8 @@ export default function MissionsPage() {
             </h2>
 
             <p className="text-sm text-zinc-700">
-              Use <b>one wallet</b> to build a consistent reputation. Daily/weekly missions can be
-              claimed again after reset; once missions are unique.
+              Use <b>one wallet</b> to build a consistent reputation. Daily/weekly
+              missions can be claimed again after reset; once missions are unique.
             </p>
 
             {/* Wallet row */}
@@ -241,7 +293,8 @@ export default function MissionsPage() {
 
             {/* Reset hint */}
             <div className="text-xs text-zinc-600 pt-1">
-              Reset reference: <b>Daily missions reset at 00:00 UTC</b>. Weekly missions reset by ISO week.
+              Reset reference: <b>Daily missions reset at 00:00 UTC</b>. Weekly
+              missions reset by ISO week.
             </div>
           </div>
 
@@ -269,7 +322,8 @@ export default function MissionsPage() {
           <div>
             <div className="font-semibold">Wallet required for verification</div>
             <div className="text-amber-900/80">
-              Connect your Solana wallet to verify on-chain missions and lock in your long-term points.
+              Connect your Solana wallet to verify on-chain missions and lock in
+              your long-term points.
             </div>
           </div>
           <PrimaryButton onClick={connectWallet} disabled={connecting}>
@@ -313,8 +367,14 @@ export default function MissionsPage() {
                   await connectWallet();
                   return;
                 }
+
+                // ✅ soft gate: require WAOC holding before verify/submit
+                const ok = await ensureWaocEligible();
+                if (!ok) return;
+
                 // ✅ verify keeps your onchain + server flow (store.tsx)
                 verify(m.id);
+
                 // ✅ optional: small delayed refresh to reflect streak/unique instantly
                 setTimeout(() => refreshExtraStats(walletAddress), 800);
               }}
@@ -322,7 +382,53 @@ export default function MissionsPage() {
           ))
         )}
       </div>
+
+      {/* =================== WAOC Gate Modal =================== */}
+      {waocGate && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-xl">
+            <div className="text-lg font-bold text-zinc-900">WAOC Required</div>
+
+            <div className="mt-2 text-sm text-zinc-700">
+              To submit / verify missions, you must hold at least{" "}
+              <span className="font-semibold">
+                {waocGate.required.toLocaleString()}
+              </span>{" "}
+              WAOC.
+            </div>
+
+            <div className="mt-2 text-sm text-zinc-700">
+              Current balance:{" "}
+              <span className="font-semibold">
+                {waocGate.balance.toLocaleString()}
+              </span>{" "}
+              WAOC
+            </div>
+
+            <div className="mt-4 flex gap-2">
+              <button
+                type="button"
+                className="flex-1 rounded-xl bg-black px-4 py-2 text-sm font-semibold text-white hover:bg-black/90"
+                onClick={() => window.open(buyUrl, "_blank")}
+              >
+                Buy WAOC
+              </button>
+              <button
+                type="button"
+                className="flex-1 rounded-xl border border-zinc-900/15 bg-white px-4 py-2 text-sm font-semibold text-zinc-900 hover:bg-zinc-50"
+                onClick={() => setWaocGate(null)}
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="mt-3 text-xs text-zinc-500">
+              WAOC is the participation layer of One Mission. Hold WAOC to unlock
+              verified contribution.
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
-
