@@ -204,40 +204,97 @@ export default function AdminPage() {
   };
 
   const adminLogin = async () => {
-    setErr("");
-    if (!connected || !walletAddress) return setErr("Connect admin wallet first.");
-    if (!canSign) return setErr("Wallet must support signMessage (e.g., Phantom).");
+  setErr("");
 
-    if (!publicKey) return setErr("Wallet not connected.");
-    if (walletAddress !== publicKey.toBase58()) {
-      return setErr("Wallet state mismatch. Please disconnect and reconnect your wallet.");
-    }
+  if (!connected || !walletAddress) {
+    return setErr("Connect admin wallet first.");
+  }
 
-    setLoading(true);
+  if (!canSign) {
+    return setErr("Wallet must support signMessage (e.g., Phantom).");
+  }
+
+  if (!publicKey) {
+    return setErr("Wallet not connected.");
+  }
+
+  if (walletAddress !== publicKey.toBase58()) {
+    return setErr(
+      "Wallet state mismatch. Please disconnect and reconnect your wallet."
+    );
+  }
+
+  setLoading(true);
+
+  try {
+    console.log("=== ADMIN LOGIN DEBUG START ===");
+    console.log("walletAddress:", walletAddress);
+    console.log("connected:", connected);
+    console.log("canSign:", canSign);
+    console.log("wallet adapter:", wallet?.adapter?.name);
+    console.log("publicKey:", publicKey?.toBase58());
+
+    // ----------------------------
+    // 1️⃣ 签名阶段
+    // ----------------------------
+    let headers: any;
+
     try {
-      // ✅ 只签一次：POST /api/mission/admin/session
-      const headers = await adminHeadersForSession(walletAddress, signMessage, "POST", "/api/mission/admin/session");
+      headers = await adminHeadersForSession(
+        walletAddress,
+        signMessage,
+        "POST",
+        "/api/mission/admin/session"
+      );
+      console.log("Signature success");
+      console.log("Generated headers:", headers);
+    } catch (signErr: any) {
+      console.error("SIGNATURE ERROR FULL OBJECT:", signErr);
+      console.error("SIGNATURE ERROR CODE:", signErr?.code);
+      console.error("SIGNATURE ERROR MESSAGE:", signErr?.message);
+      console.error("SIGNATURE ERROR DATA:", signErr?.data);
 
-      const { r, j } = await fetchJson("/api/mission/admin/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...headers },
-        cache: "no-store",
-        credentials: "include", // ✅ 关键：让后端 set-cookie 生效
-        body: JSON.stringify({}),
-      });
-
-      if (!r.ok || !j?.ok) {
-        return setErr(j?.error || `Admin login failed (${r.status})`);
-      }
-
-      // ✅ 立刻同步 session
-      await checkAdminSession();
-    } catch (e: any) {
-      setErr(normalizeWalletSignError(e));
-    } finally {
-      setLoading(false);
+      throw signErr; // 交给外层 catch
     }
-  };
+
+    // ----------------------------
+    // 2️⃣ 后端请求阶段
+    // ----------------------------
+    const { r, j } = await fetchJson("/api/mission/admin/session", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...headers,
+      },
+      cache: "no-store",
+      credentials: "include",
+      body: JSON.stringify({}),
+    });
+
+    console.log("Server response status:", r.status);
+    console.log("Server response json:", j);
+
+    if (!r.ok || !j?.ok) {
+      return setErr(j?.error || `Admin login failed (${r.status})`);
+    }
+
+    // ----------------------------
+    // 3️⃣ 同步 session
+    // ----------------------------
+    await checkAdminSession();
+
+    console.log("=== ADMIN LOGIN SUCCESS ===");
+  } catch (e: any) {
+    console.error("ADMIN LOGIN FAILED FULL OBJECT:", e);
+    console.error("ERROR CODE:", e?.code);
+    console.error("ERROR MESSAGE:", e?.message);
+    console.error("ERROR DATA:", e?.data);
+
+    setErr(normalizeWalletSignError(e));
+  } finally {
+    setLoading(false);
+  }
+};
 
   const adminLogout = async () => {
     setErr("");
